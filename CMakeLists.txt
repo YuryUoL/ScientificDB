@@ -42,8 +42,9 @@ if(EXISTS ${polyscope_SOURCE_DIR}/include/polyscope/weak_handle.h)
     endif()
 endif()
 
-# Find OpenMP for parallel descriptor generation
+# Find OpenMP and TBB for parallel execution
 find_package(OpenMP REQUIRED)
+find_package(TBB REQUIRED)
 
 # Include paths for system-installed FAISS and CUDA headers
 include_directories(
@@ -59,7 +60,7 @@ link_directories(
 
 add_executable(ScientificDB main.cpp)
 
-# Link chemfiles, polyscope, readline, FAISS, OpenBLAS, CUDA runtimes, and OpenMP
+# Link chemfiles, polyscope, readline, FAISS, OpenBLAS, CUDA runtimes, OpenMP, and TBB
 target_link_libraries(ScientificDB PRIVATE 
     chemfiles 
     polyscope
@@ -69,4 +70,5 @@ target_link_libraries(ScientificDB PRIVATE
     cudart
     cublas
     OpenMP::OpenMP_CXX
+    TBB::tbb
 )
