@@ -80,6 +80,7 @@ int main(int argc, char *argv[])
 {
     std::cout << "Initializing Polyscope GUI...\n";
     PolyscopeBridge::init();
+    MatchingViz::install();
 
     MolecularDatasetStore xyzStore;
     CommandDispatcher ui;
@@ -355,9 +356,15 @@ int main(int argc, char *argv[])
     ui.registerAlias("knnAll", "knn_all");
 
     // Register Command: pair_dist <idx1> <idx2> [metric]
+   // Register Command: pair_dist <idx1> <idx2> [metric] [key=val ...]
     ui.registerCommand(
-        "pair_dist", "<index1> <index2> [metric: srv/sdv/pdd/aligner]",
-        "Computes exact distance metric or full rigid alignment with bottleneck distance and point matching.",
+        "pair_dist", "<index1> <index2> [metric: srv/sdv/pdd/aligner] [key=val ...]",
+        "Computes exact distance metric or full rigid alignment with bottleneck distance and point matching.\n"
+        "  Parameters for aligner:\n"
+        "    refine=<int>   : Kabsch refinement rounds (default: 0)\n"
+        "    symbol=<0/1>   : Restrict alignment and matching to same-symbol atoms (default: 0)\n"
+        "  Example:\n"
+        "    pair_dist 4210 4214 aligner refine=4 symbol=1",
         [&](std::istringstream &iss)
         {
             size_t idx1, idx2;
@@ -369,7 +376,22 @@ int main(int argc, char *argv[])
 
                 if (metric == "aligner")
                 {
-                    xyzStore.printPairAlignment(idx1, idx2);
+                    AlignmentOptions opt;
+                    std::string token;
+                    while (iss >> token)
+                    {
+                        size_t eq = token.find('=');
+                        if (eq != std::string::npos)
+                        {
+                            std::string k = token.substr(0, eq);
+                            std::string v = token.substr(eq + 1);
+                            if (k == "refine")
+                                opt.refineIterations = std::stoi(v);
+                            else if (k == "symbol" || k == "same_symbol")
+                                opt.requireSameSymbol = (v == "1" || v == "on" || v == "true");
+                        }
+                    }
+                    xyzStore.printPairAlignment(idx1, idx2, opt);
                 }
                 else
                 {
@@ -393,7 +415,7 @@ int main(int argc, char *argv[])
             }
             else
             {
-                std::cout << "Usage: pair_dist <index1> <index2> [metric: srv/sdv/pdd/aligner]\n";
+                std::cout << "Usage: pair_dist <index1> <index2> [metric: srv/sdv/pdd/aligner] [key=val ...]\n";
             }
         });
     ui.registerAlias("pairDist", "pair_dist");
@@ -443,9 +465,108 @@ int main(int argc, char *argv[])
                        [&](std::istringstream &)
                        { MatchingViz::clearAll(); });
 
+     ui.registerCommand("show_matches", "", "Shows all stored matchings.",
+                       [&](std::istringstream &)
+                       { xyzStore.setAllMatchesVisible(true); });
+    ui.registerCommand("hide_matches", "", "Hides all stored matchings.",
+                       [&](std::istringstream &)
+                       { xyzStore.setAllMatchesVisible(false); });
+
     // ==========================================
     // 5. SYSTEM & GENERAL COMMANDS
     // ==========================================
+
+   // Register Command: dup_check <index|all> [epsilon|csv_file] [key=val ...]
+    ui.registerCommand(
+        "dup_check", "<index|all> [epsilon|csv_file] [key=val ...]",
+        "Checks if molecule <index> or ALL molecules are duplicates against the DB.\n"
+        "  Parameters & Runtime Options:\n"
+        "    epsilon        : Max per-atom displacement threshold (default: 0.05)\n"
+        "    srvf=<float>   : Stage 1 SRV radius multiplier factor (default: 1.0)\n"
+        "    sdvf=<float>   : Stage 2 SDV radius multiplier factor (default: 2.0)\n"
+        "    pddf=<float>   : Stage 3 PDD radius multiplier factor (default: 2.0)\n"
+        "    alignf=<float> : Stage 4 Aligned radius multiplier factor (default: 1.0)\n"
+        "    tol=<float>    : Floating-point noise slack tolerance (default: 1e-4)\n"
+        "    comp=<0/1>     : Require identical element composition multiset (default: 1)\n"
+        "    label=<0/1>    : Require identical comment/label line (default: 0)\n"
+        "    species=<0/1>  : Drop matches with mismatched element pairing (default: 0)\n"
+        "    exact=<0/1>    : True = find true minimum; False = fast early-exit (default: 1)\n"
+        "    refine=<int>   : Kabsch alignment refinement iterations (default: 0, disabled)\n"
+        "    max=<int>      : Keep only top N best matches, 0 = all (default: 0)\n"
+        "    threads=<int>  : OpenMP thread count override, 0 = max available (default: 0)\n"
+        "    parallel=<0/1> : Enable/disable multi-threaded candidate evaluation (default: 1)\n"
+        "  Runtime Usage Examples:\n"
+        "    dup_check 0 0.05 refine=4 label=1 alignf=1.5\n"
+        "    dup_check all duplicates.csv 0.05 refine=4 parallel=1",
+        [&](std::istringstream &iss)
+        {
+            std::string arg1;
+            if (!(iss >> arg1))
+            {
+                std::cout << "Usage: dup_check <index|all> [epsilon|csv_file] [key=val ...]\n";
+                return;
+            }
+
+            if (arg1 == "all")
+            {
+                std::string csvPath = "duplicates.csv";
+                if (!(iss >> csvPath))
+                    csvPath = "duplicates.csv";
+
+                DupCheckParams p;
+                std::string token;
+                while (iss >> token)
+                {
+                    size_t eq = token.find('=');
+                    if (eq != std::string::npos)
+                    {
+                        p.set(token.substr(0, eq), token.substr(eq + 1));
+                    }
+                    else
+                    {
+                        try {
+                            p.epsilon = std::stof(token);
+                        } catch (...) {}
+                    }
+                }
+
+                DupRunStats st;
+                auto matches = xyzStore.runBatchDuplicateCheck(csvPath, p, st);
+                DuplicateChecker::printBatchReport(p, st, matches, csvPath);
+            }
+            else
+            {
+                size_t idx = std::stoul(arg1);
+                DupCheckParams p;
+                if (iss >> std::ws && iss.peek() != EOF)
+                {
+                    std::string token;
+                    iss >> token;
+                    try {
+                        p.epsilon = std::stof(token);
+                    } catch (...) {
+                        size_t eq = token.find('=');
+                        if (eq != std::string::npos) {
+                            p.set(token.substr(0, eq), token.substr(eq + 1));
+                        }
+                    }
+                }
+                std::string kVal;
+                while (iss >> kVal) {
+                    size_t eq = kVal.find('=');
+                    if (eq != std::string::npos) {
+                        p.set(kVal.substr(0, eq), kVal.substr(eq + 1));
+                    }
+                }
+                DupRunStats st;
+                auto matches = xyzStore.runDuplicateCheck(idx, p, st);
+                DuplicateChecker::printReport(idx, p, st, matches);
+            }
+        });
+    ui.registerAlias("duplicateCheck", "dup_check");
+    ui.registerAlias("dupCheck", "dup_check");
+
+    
 
     // Register Command: help
     ui.registerCommand("help", "", "Displays this command usage reference.",
@@ -510,7 +631,7 @@ int main(int argc, char *argv[])
         }
 
         // Keep Polyscope responsive continuously
-        MatchingViz::update();
+       // MatchingViz::update();
         PolyscopeBridge::drawFrame();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }

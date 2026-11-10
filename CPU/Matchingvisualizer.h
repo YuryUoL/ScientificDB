@@ -14,6 +14,9 @@
 #include "PolyscopeBridge.h"
 #include "CloudAligmentEvaluator.h"
 
+#include <imgui.h>
+#include <polyscope/view.h>
+
 namespace MatchingViz {
 
 struct MatchRecord {
@@ -29,6 +32,10 @@ struct MatchRecord {
 };
 
 inline std::vector<MatchRecord> s_matches;
+
+inline bool  s_showAllMatches = true;                 // global master switch
+inline float s_lineThickness  = 1.5f;
+inline float s_lineColor[4]   = {1.0f, 0.8f, 0.1f, 0.9f};
 
 inline std::string cloudName(size_t id, const std::string& filename) {
     return "Molecule_" + std::to_string(id) + "_" + filename;
@@ -94,73 +101,74 @@ inline void store(size_t idA, size_t idB, const std::string& fileA, const std::s
     m.bottleneck = res.bestBottleneck;
     for (int i = 0; i < 9; ++i) m.R[i] = res.rotation[i];
     for (int i = 0; i < 3; ++i) m.t[i] = res.translation[i];
+    m.visible = false;   // hidden until the user runs show_match
     s_matches.push_back(std::move(m));
 }
 
 // Call once per frame from the main loop, before drawFrame().
 // Lines are shown only while the record is visible AND both clouds are rendered/enabled.
-inline void update() {
-    if (!polyscope::state::initialized) return;
+// Draws matching lines in screen space. Runs inside the ImGui frame
+// (same place the atom labels are drawn), so it always matches the gizmo.
+inline void drawLines() {
+    if (!polyscope::state::initialized || !s_showAllMatches || s_matches.empty()) return;
 
-    for (auto& m : s_matches) {
-        polyscope::PointCloud* ca = nullptr;
-        polyscope::PointCloud* cb = nullptr;
-        bool show = m.visible && !m.matching.empty();
+    const glm::mat4 view = polyscope::view::getCameraViewMatrix();
+    const glm::mat4 proj = polyscope::view::getCameraPerspectiveMatrix();
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const ImU32 col = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(s_lineColor[0], s_lineColor[1], s_lineColor[2], s_lineColor[3]));
 
-        if (show) {
-            if (!polyscope::hasPointCloud(m.nameA) || !polyscope::hasPointCloud(m.nameB)) {
-                show = false;
-            } else {
-                ca = polyscope::getPointCloud(m.nameA);
-                cb = polyscope::getPointCloud(m.nameB);
-                show = ca->isEnabled() && cb->isEnabled();
-            }
-        }
+    auto project = [&](const glm::mat4& mvp, const glm::vec3& p, ImVec2& out) -> bool {
+        glm::vec4 clip = mvp * glm::vec4(p, 1.0f);
+        if (clip.w <= 0.0f) return false;                     // behind camera
+        glm::vec3 ndc = glm::vec3(clip) / clip.w;
+        out = ImVec2((ndc.x * 0.5f + 0.5f) * display.x,
+                     (1.0f - (ndc.y * 0.5f + 0.5f)) * display.y);
+        return true;
+    };
+
+    for (const auto& m : s_matches) {
+        if (!m.visible || m.matching.empty()) continue;
+        if (!polyscope::hasPointCloud(m.nameA) || !polyscope::hasPointCloud(m.nameB)) continue;
+
+        auto* ca = polyscope::getPointCloud(m.nameA);
+        auto* cb = polyscope::getPointCloud(m.nameB);
+        if (!ca->isEnabled() || !cb->isEnabled()) continue;
 
         auto itA = PolyscopeBridge::s_labelData.find(m.nameA);
         auto itB = PolyscopeBridge::s_labelData.find(m.nameB);
-        if (show && (itA == PolyscopeBridge::s_labelData.end() || itB == PolyscopeBridge::s_labelData.end())) {
-            show = false;
-        }
-
-        if (!show) {
-            dropNetwork(m);
-            continue;
-        }
+        if (itA == PolyscopeBridge::s_labelData.end() || itB == PolyscopeBridge::s_labelData.end()) continue;
 
         const auto& locA = itA->second.localPositions;
         const auto& locB = itB->second.localPositions;
-        const size_t n = m.matching.size();
-        if (locA.size() < n || locB.size() < n) { dropNetwork(m); continue; }
+        const glm::mat4 mvpA = proj * view * ca->getTransform();   // includes gizmo
+        const glm::mat4 mvpB = proj * view * cb->getTransform();
 
-        const glm::mat4 TA = ca->getTransform();
-        const glm::mat4 TB = cb->getTransform();
-        const std::string name = netName(m);
-        const bool exists = polyscope::hasCurveNetwork(name);
-        if (exists && TA == m.lastA && TB == m.lastB) continue;   // nothing moved
-
-        // Nodes 0..n-1 = atoms of A (world space), n..2n-1 = atoms of B (world space)
-        std::vector<glm::vec3> nodes(2 * n);
-        for (size_t i = 0; i < n; ++i) {
-            nodes[i]     = glm::vec3(TA * glm::vec4(locA[i], 1.0f));
-            nodes[n + i] = glm::vec3(TB * glm::vec4(locB[i], 1.0f));
+        for (size_t i = 0; i < m.matching.size() && i < locA.size(); ++i) {
+            size_t j = m.matching[i];
+            if (j >= locB.size()) continue;
+            ImVec2 a, b;
+            if (project(mvpA, locA[i], a) && project(mvpB, locB[j], b))
+                dl->AddLine(a, b, col, s_lineThickness);
         }
-
-        if (!exists) {
-            std::vector<std::array<size_t, 2>> edges(n);
-            for (size_t i = 0; i < n; ++i) {
-                size_t j = std::min(m.matching[i], n - 1);
-                edges[i] = {i, n + j};
-            }
-            auto* net = polyscope::registerCurveNetwork(name, nodes, edges);
-            net->setRadius(0.004f, true);
-            net->setColor(glm::vec3(1.0f, 0.8f, 0.1f));
-        } else {
-            polyscope::getCurveNetwork(name)->updateNodePositions(nodes);
-        }
-        m.lastA = TA;
-        m.lastB = TB;
     }
+}
+
+// Call once after PolyscopeBridge::init(). Chains onto the existing extra callback.
+inline void install() {
+    auto prev = PolyscopeBridge::s_extraUserCallback;
+    PolyscopeBridge::s_extraUserCallback = [prev]() {
+        drawLines();
+        ImGui::Checkbox("Show matching lines", &s_showAllMatches);
+        ImGui::SliderFloat("Line thickness", &s_lineThickness, 0.5f, 5.0f);
+        ImGui::ColorEdit4("Line color", s_lineColor, ImGuiColorEditFlags_NoInputs);
+        if (prev) prev();
+    };
+}
+
+inline void setAllVisible(bool v) {
+    for (auto& m : s_matches) m.visible = v;
 }
 
 // Snap cloud A onto cloud B using the stored rotation (record must be stored as A -> B)
