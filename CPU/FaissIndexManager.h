@@ -41,6 +41,24 @@ public:
     FaissIndexManager() = default;
     ~FaissIndexManager() { clear(); }
 
+    size_t groupSize(size_t n) const
+    {
+        size_t count = 0;
+        for (const auto &d : m_descriptors)
+        {
+            if (d.computed && d.numAtoms == n)
+                count++;
+        }
+        return count;
+    }
+
+    const MolecularDescriptors *descriptor(size_t index) const
+    {
+        if (index >= m_descriptors.size() || !m_descriptors[index].computed)
+            return nullptr;
+        return &m_descriptors[index];
+    }
+
     int parseK(const std::string &kStr, size_t totalSize) const
     {
         if (kStr.empty())
@@ -70,6 +88,64 @@ public:
                 return 5;
             }
         }
+    }
+
+    void rangeSearchSrvLinf(const std::vector<float> &querySrv, size_t n, float radius, size_t queryIdx, int numThreads, std::vector<size_t> &outIds) const
+    {
+        outIds.clear();
+        std::vector<size_t> groupIndices;
+        for (size_t i = 0; i < m_descriptors.size(); ++i)
+        {
+            if (m_descriptors[i].computed && m_descriptors[i].numAtoms == n)
+            {
+                groupIndices.push_back(i);
+            }
+        }
+        if (groupIndices.empty() || querySrv.empty())
+            return;
+
+        outIds.resize(groupIndices.size());
+        std::vector<char> keep(groupIndices.size(), 0);
+
+        int nt = numThreads > 0 ? numThreads : omp_get_max_threads();
+#pragma omp parallel for schedule(static) num_threads(nt)
+        for (long long idx = 0; idx < static_cast<long long>(groupIndices.size()); ++idx)
+        {
+            size_t globalId = groupIndices[idx];
+            if (globalId == queryIdx)
+                continue;
+
+            const auto &candSrv = m_descriptors[globalId].srv;
+            if (candSrv.size() != querySrv.size())
+                continue;
+
+            float maxDiff = 0.0f;
+            for (size_t k = 0; k < querySrv.size(); ++k)
+            {
+                float diff = std::fabs(querySrv[k] - candSrv[k]);
+                if (diff > radius)
+                {
+                    maxDiff = diff;
+                    break;
+                }
+                maxDiff = std::max(maxDiff, diff);
+            }
+
+            if (maxDiff <= radius)
+            {
+                keep[idx] = 1;
+            }
+        }
+
+        size_t w = 0;
+        for (size_t idx = 0; idx < groupIndices.size(); ++idx)
+        {
+            if (keep[idx])
+            {
+                outIds[w++] = groupIndices[idx];
+            }
+        }
+        outIds.resize(w);
     }
 
     bool searchKNN(size_t queryIdx, const std::string &kStr, const std::string &metricType,
@@ -720,35 +796,44 @@ public:
         // Preview SRV
         std::cout << "  SRV (Sorted Center Distances): [";
         size_t srvLimit = std::min(desc.srv.size(), (size_t)5);
-        for (size_t i = 0; i < srvLimit; ++i) {
+        for (size_t i = 0; i < srvLimit; ++i)
+        {
             std::cout << std::fixed << std::setprecision(3) << desc.srv[i] << (i + 1 < srvLimit ? ", " : "");
         }
-        if (desc.srv.size() > srvLimit) std::cout << ", ...";
+        if (desc.srv.size() > srvLimit)
+            std::cout << ", ...";
         std::cout << "]\n";
 
         // Preview SDV
         std::cout << "  SDV (Sorted Pairwise Distances): [";
         size_t sdvLimit = std::min(desc.sdv.size(), (size_t)5);
-        for (size_t i = 0; i < sdvLimit; ++i) {
+        for (size_t i = 0; i < sdvLimit; ++i)
+        {
             std::cout << std::fixed << std::setprecision(3) << desc.sdv[i] << (i + 1 < sdvLimit ? ", " : "");
         }
-        if (desc.sdv.size() > sdvLimit) std::cout << ", ...";
+        if (desc.sdv.size() > sdvLimit)
+            std::cout << ", ...";
         std::cout << "]\n";
 
         // Preview PDD Matrix (first 4x4 subset of actual distances via sqrt)
         std::cout << "  PDD Matrix Preview (" << std::min(n, (size_t)4) << "x" << std::min(n, (size_t)4) << "):\n";
         size_t rowLimit = std::min(n, (size_t)4);
         size_t colLimit = std::min(n, (size_t)4);
-        for (size_t r = 0; r < rowLimit; ++r) {
+        for (size_t r = 0; r < rowLimit; ++r)
+        {
             std::cout << "    Row " << std::setw(2) << r << ": [";
-            for (size_t c = 0; c < colLimit; ++c) {
+            for (size_t c = 0; c < colLimit; ++c)
+            {
                 std::cout << std::setw(8) << std::fixed << std::setprecision(2) << std::sqrt(desc.pdd[r * n + c]);
-                if (c + 1 < colLimit) std::cout << ", ";
+                if (c + 1 < colLimit)
+                    std::cout << ", ";
             }
-            if (n > colLimit) std::cout << ", ...";
+            if (n > colLimit)
+                std::cout << ", ...";
             std::cout << "]\n";
         }
-        if (n > rowLimit) {
+        if (n > rowLimit)
+        {
             std::cout << "    ...\n";
         }
         std::cout << "=======================================================\n\n";
