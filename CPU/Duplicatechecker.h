@@ -37,7 +37,8 @@ struct DupCheckParams
         try
         {
             auto b = [&]() { return v == "1" || v == "on" || v == "true"; };
-            if (k == "srvf") srvFactor = std::stof(v);
+            if (k == "epsilon" || k == "eps") epsilon = std::stof(v);
+            else if (k == "srvf") srvFactor = std::stof(v);
             else if (k == "sdvf") sdvFactor = std::stof(v);
             else if (k == "pddf") pddFactor = std::stof(v);
             else if (k == "alignf") alignFactor = std::stof(v);
@@ -223,10 +224,11 @@ public:
         t0 = omp_get_wtime();
         {
             std::vector<CloudAlignmentEvaluator::Point3F> cloudQ = toCloud(qAtoms);
-            AlignmentOptions opt;
-            opt.acceptDistance = p.exactDistance ? 0.0f : eps;
+           AlignmentOptions opt;
+            opt.exact = p.exactDistance;
+            opt.acceptDistance = p.exactDistance ? 0.0f : lim(p.alignFactor);
             opt.refineIterations = p.refineIterations;
-            const float accept = lim(p.alignFactor); // Multiplies epsilon by alignf factor
+            const float accept = lim(p.alignFactor);
 
             std::vector<DupMatch> slots(cands.size());
             std::vector<char> ok(cands.size(), 0);
