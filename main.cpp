@@ -355,16 +355,18 @@ int main(int argc, char *argv[])
         });
     ui.registerAlias("knnAll", "knn_all");
 
-    // Register Command: pair_dist <idx1> <idx2> [metric]
-   // Register Command: pair_dist <idx1> <idx2> [metric] [key=val ...]
+
     ui.registerCommand(
         "pair_dist", "<index1> <index2> [metric: srv/sdv/pdd/aligner] [key=val ...]",
         "Computes exact distance metric or full rigid alignment with bottleneck distance and point matching.\n"
         "  Parameters for aligner:\n"
         "    refine=<int>   : Kabsch refinement rounds (default: 0)\n"
         "    symbol=<0/1>   : Restrict alignment and matching to same-symbol atoms (default: 0)\n"
+        "    accept=<float> : Accept/stop threshold distance (default: 0.0)\n"
+        "    max=<int>      : Max candidate pairs to evaluate, 0 = all (default: 0)\n"
+        "    exact=<0/1>    : 1 = find optimal minimum; 0 = return any / early-exit (default: 1)\n"
         "  Example:\n"
-        "    pair_dist 4210 4214 aligner refine=4 symbol=1",
+        "    pair_dist 4210 4214 aligner refine=4 symbol=1 exact=1",
         [&](std::istringstream &iss)
         {
             size_t idx1, idx2;
@@ -383,19 +385,14 @@ int main(int argc, char *argv[])
                         size_t eq = token.find('=');
                         if (eq != std::string::npos)
                         {
-                            std::string k = token.substr(0, eq);
-                            std::string v = token.substr(eq + 1);
-                            if (k == "refine")
-                                opt.refineIterations = std::stoi(v);
-                            else if (k == "symbol" || k == "same_symbol")
-                                opt.requireSameSymbol = (v == "1" || v == "on" || v == "true");
+                            opt.set(token.substr(0, eq), token.substr(eq + 1));
                         }
                     }
                     xyzStore.printPairAlignment(idx1, idx2, opt);
                 }
                 else
                 {
-                    auto tStart = std::chrono::high_resolution_clock::now();
+                          auto tStart = std::chrono::high_resolution_clock::now();
                     float dist = xyzStore.computePairMetric(idx1, idx2, metric);
                     auto tEnd = std::chrono::high_resolution_clock::now();
                     double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
@@ -418,6 +415,10 @@ int main(int argc, char *argv[])
                 std::cout << "Usage: pair_dist <index1> <index2> [metric: srv/sdv/pdd/aligner] [key=val ...]\n";
             }
         });
+
+    // Register Command: pair_dist <idx1> <idx2> [metric]
+   // Register Command: pair_dist <idx1> <idx2> [metric] [key=val ...]
+   
     ui.registerAlias("pairDist", "pair_dist");
     ui.registerAlias("dist_pair", "pair_dist");
 
@@ -529,6 +530,18 @@ int main(int argc, char *argv[])
                         } catch (...) {}
                     }
                 }
+
+                // -> PRINT PARAMETERS IMMEDIATELY HERE <-
+                std::cout << "\n[DupCheck] Running batch duplicate check with parameters:\n"
+                          << "  epsilon    : " << p.epsilon << "\n"
+                          << "  exact      : " << (p.exactDistance ? "1 (optimal)" : "0 (early-exit)") << "\n"
+                          << "  alignf     : " << p.alignFactor << "\n"
+                          << "  srvf       : " << p.srvFactor << "\n"
+                          << "  sdvf       : " << p.sdvFactor << "\n"
+                          << "  pddf       : " << p.pddFactor << "\n"
+                          << "  refine     : " << p.refineIterations << "\n"
+                          << "  threads    : " << (p.numThreads > 0 ? p.numThreads : omp_get_max_threads()) << "\n"
+                          << "  csvOutput  : " << csvPath << "\n\n" << std::flush;
 
                 DupRunStats st;
                 auto matches = xyzStore.runBatchDuplicateCheck(csvPath, p, st);
