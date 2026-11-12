@@ -13,6 +13,7 @@
 #include "CloudAligmentEvaluator.h"
 #include "Matchingvisualizer.h"
 #include "Duplicatechecker.h"
+#include "MolecularGraphViz.h"
 
 struct MoleculeEntry
 {
@@ -81,7 +82,7 @@ public:
         m_entries.push_back(std::move(mol));
         return true;
     }
-    std::vector<DupMatch> runDuplicateCheck(size_t queryIdx, const DupCheckParams &p, DupRunStats &st) const
+    std::vector<DupMatch> runDuplicateCheck(size_t queryIdx, const std::string &csvPath, const DupCheckParams &p, DupRunStats &st)
     {
         DuplicateChecker checker;
         if (queryIdx >= m_entries.size())
@@ -98,16 +99,51 @@ public:
             st = DupRunStats{};
             return {};
         }
-        return checker.run(
+
+        std::vector<DupMatch> matches = checker.run(
             m_faissManager,
             queryIdx,
             *qDesc,
             qMol.atoms,
-            [this](size_t i) -> const std::vector<AtomRecord>& { return m_entries[i].atoms; },
-            [this](size_t i) -> std::string { return m_entries[i].commentLine; },
+            [this](size_t i) -> const std::vector<AtomRecord> &
+            { return m_entries[i].atoms; },
+            [this](size_t i) -> std::string
+            { return m_entries[i].commentLine; },
             p,
-            st
-        );
+            st);
+
+        // Store matchings for visualization
+        for (const auto &m : matches)
+        {
+            const auto &molA = m_entries[m.queryIdx];
+            const auto &molB = m_entries[m.matchIdx];
+            MatchingViz::store(molA.id, molB.id, molA.filename, molB.filename, m.align);
+        }
+
+        // Write CSV if path provided
+        if (!csvPath.empty() && !matches.empty())
+        {
+            std::ofstream csv(csvPath);
+            if (csv.is_open())
+            {
+                csv << "MolA,MolB,Atoms,align,pdd,sdv,srv,mismatch\n";
+                for (const auto &m : matches)
+                {
+                    csv << m.queryIdx << ","
+                        << m.matchIdx << ","
+                        << m.numAtoms << ","
+                        << std::fixed << std::setprecision(6)
+                        << m.alignBottleneck << ","
+                        << m.pddBottleneck << ","
+                        << m.sdvLinf << ","
+                        << m.srvLinf << ","
+                        << m.speciesMismatches << "\n";
+                }
+                std::cout << "[XyzStore] Successfully wrote " << matches.size() << " duplicate pairs to " << csvPath << "\n";
+            }
+        }
+
+        return matches;
     }
     std::vector<DupMatch> runBatchDuplicateCheck(const std::string &csvPath, const DupCheckParams &p, DupRunStats &st)
     {
@@ -123,11 +159,12 @@ public:
         std::vector<DupMatch> matches = checker.runAll(
             m_faissManager,
             totalMols,
-            [this](size_t i) -> const std::vector<AtomRecord>& { return m_entries[i].atoms; },
-            [this](size_t i) -> std::string { return m_entries[i].commentLine; },
+            [this](size_t i) -> const std::vector<AtomRecord> &
+            { return m_entries[i].atoms; },
+            [this](size_t i) -> std::string
+            { return m_entries[i].commentLine; },
             p,
-            st
-        );
+            st);
 
         // Store all valid matchings and rotations in RAM for visualization / alignment application
         for (const auto &m : matches)
@@ -143,14 +180,24 @@ public:
             std::ofstream csv(csvPath);
             if (csv.is_open())
             {
-                csv << "MolAIndx,MolBIndx,AlignerDist,NumAtoms\n";
+                csv << "MolA,MolB,Atoms,align,pdd,sdv,srv,mismatch\n";
                 for (const auto &m : matches)
                 {
-                    csv << m.queryIdx << "," << m.matchIdx << "," << std::fixed << std::setprecision(6) << m.alignBottleneck << "," << m.numAtoms << "\n";
+                    csv << m.queryIdx << ","
+                        << m.matchIdx << ","
+                        << m.numAtoms << ","
+                        << std::fixed << std::setprecision(6)
+                        << m.alignBottleneck << ","
+                        << m.pddBottleneck << ","
+                        << m.sdvLinf << ","
+                        << m.srvLinf << ","
+                        << m.speciesMismatches << "\n";
                 }
                 std::cout << "[XyzStore] Successfully wrote " << matches.size() << " duplicate pairs to " << csvPath << "\n";
             }
         }
+
+        m_lastBatchMatches = matches;
 
         return matches;
     }
@@ -223,7 +270,7 @@ public:
         m_faissManager.printDistanceDistribution();
     }
 
-   void printPairAlignment(size_t idxA, size_t idxB, AlignmentOptions opt = AlignmentOptions()) const
+    void printPairAlignment(size_t idxA, size_t idxB, AlignmentOptions opt = AlignmentOptions()) const
     {
         if (idxA >= m_entries.size() || idxB >= m_entries.size())
         {
@@ -486,10 +533,41 @@ public:
         m_faissManager.clear();
     }
 
+    void exploreClusters()
+{
+    if (m_lastBatchMatches.empty())
+    {
+        std::cout << "[XyzStore] Error: No recent batch duplicate check found. Run 'dup_check all' first.\n";
+        return;
+    }
+
+    std::vector<std::string> filenames(m_entries.size());
+    std::vector<size_t> atomCounts(m_entries.size());
+    for (size_t i = 0; i < m_entries.size(); ++i)
+    {
+        filenames[i] = m_entries[i].filename;
+        atomCounts[i] = m_entries[i].numAtoms;
+    }
+
+    MolecularGraphViz::buildClusters(m_lastBatchMatches, atomCounts);
+}
+
+
+    void setGraphVisible(bool visible) const
+    {
+        MolecularGraphViz::setGraphVisible(visible);
+    }
+
+    void clearGraph() const
+{
+    MolecularGraphViz::clearGraph();
+}
+
 private:
     std::vector<MoleculeEntry> m_entries;
     size_t m_nextId = 0;
     FaissIndexManager m_faissManager;
+    std::vector<DupMatch> m_lastBatchMatches;
 
     void printProgressBar(size_t current, size_t total) const
     {
