@@ -17,41 +17,57 @@
 
 struct DupCheckParams
 {
-    float epsilon = 0.05f;               // Max per-atom displacement after alignment (Angstroms)
-    float srvFactor = 1.0f;              // Stage 1 radius factor[cite: 3]
-    float sdvFactor = 2.0f;              // Stage 2 radius factor[cite: 3]
-    float pddFactor = 2.0f;              // Stage 3 radius factor[cite: 3]
-    float alignFactor = 1.0f;            // Stage 4 aligner radius factor
-    float relTol = 1e-4f;                // Float-noise slack on thresholds[cite: 3]
-    bool requireSameComposition = true;  // Candidates must share element symbol multiset[cite: 3]
-    bool requireSameLabel = false;       // Candidates must share the same label/comment line[cite: 3]
-    bool rejectSpeciesMismatch = false;  // Drop matches whose aligner pairs different elements[cite: 3]
-    bool exactDistance = true;           // True: finds true minimum (<= eps); false: stops at first <= eps[cite: 3]
-    int refineIterations = 0;            // Aligner Kabsch refinement rounds (0 = disabled by default)[cite: 3]
-    size_t maxMatches = 0;               // Keep only best N matches (0 = all)[cite: 3]
-    int numThreads = 0;                  // 0 = OpenMP default[cite: 3]
-    bool parallel = true;                // Enable/disable multi-threaded candidate evaluation[cite: 3]
+    float epsilon = 0.05f;              // Max per-atom displacement after alignment (Angstroms)
+    float srvFactor = 1.0f;             // Stage 1 radius factor
+    float sdvFactor = 2.0f;             // Stage 2 radius factor
+    float pddFactor = 2.0f;             // Stage 3 radius factor
+    float alignFactor = 1.0f;           // Stage 4 aligner radius factor
+    float relTol = 1e-4f;               // Float-noise slack on thresholds
+    bool requireSameComposition = true; // Candidates must share element symbol multiset
+    bool requireSameLabel = false;      // Candidates must share the same label/comment line
+    bool rejectSpeciesMismatch = false; // Drop matches whose aligner pairs different elements
+    bool exactDistance = true;          // True: finds true minimum (<= eps); false: stops at first <= eps
+    int refineIterations = 0;           // Aligner Kabsch refinement rounds (0 = disabled by default)
+    size_t maxMatches = 0;              // Keep only best N matches (0 = all)
+    int numThreads = 0;                 // 0 = OpenMP default
+    bool parallel = true;               // Enable/disable multi-threaded candidate evaluation
 
     bool set(const std::string &k, const std::string &v)
     {
         try
         {
-            auto b = [&]() { return v == "1" || v == "on" || v == "true"; };
-            if (k == "epsilon" || k == "eps") epsilon = std::stof(v);
-            else if (k == "srvf") srvFactor = std::stof(v);
-            else if (k == "sdvf") sdvFactor = std::stof(v);
-            else if (k == "pddf") pddFactor = std::stof(v);
-            else if (k == "alignf") alignFactor = std::stof(v);
-            else if (k == "tol") relTol = std::stof(v);
-            else if (k == "comp") requireSameComposition = b();
-            else if (k == "label") requireSameLabel = b();
-            else if (k == "species") rejectSpeciesMismatch = b();
-            else if (k == "exact") exactDistance = b();
-            else if (k == "refine") refineIterations = std::stoi(v);
-            else if (k == "max") maxMatches = static_cast<size_t>(std::stoul(v));
-            else if (k == "threads") numThreads = std::stoi(v);
-            else if (k == "parallel") parallel = b();
-            else return false;
+            auto b = [&]()
+            { return v == "1" || v == "on" || v == "true"; };
+            if (k == "epsilon" || k == "eps")
+                epsilon = std::stof(v);
+            else if (k == "srvf")
+                srvFactor = std::stof(v);
+            else if (k == "sdvf")
+                sdvFactor = std::stof(v);
+            else if (k == "pddf")
+                pddFactor = std::stof(v);
+            else if (k == "alignf")
+                alignFactor = std::stof(v);
+            else if (k == "tol")
+                relTol = std::stof(v);
+            else if (k == "comp")
+                requireSameComposition = b();
+            else if (k == "label")
+                requireSameLabel = b();
+            else if (k == "species")
+                rejectSpeciesMismatch = b();
+            else if (k == "exact")
+                exactDistance = b();
+            else if (k == "refine")
+                refineIterations = std::stoi(v);
+            else if (k == "max")
+                maxMatches = static_cast<size_t>(std::stoul(v));
+            else if (k == "threads")
+                numThreads = std::stoi(v);
+            else if (k == "parallel")
+                parallel = b();
+            else
+                return false;
             return true;
         }
         catch (...)
@@ -122,7 +138,8 @@ public:
 
         const double tAll = omp_get_wtime();
         const float eps = p.epsilon;
-        auto lim = [&](float factor) { return factor * eps * (1.0f + p.relTol) + 1e-6f; };
+        auto lim = [&](float factor)
+        { return factor * eps * (1.0f + p.relTol) + 1e-6f; };
         const int nt = st.threads;
 
         // ---- Stage 1: SRV LInf range scan
@@ -149,7 +166,8 @@ public:
             const float sdvLim = lim(p.sdvFactor);
             std::vector<char> keep(cands.size(), 0);
 
-            auto worker2 = [&](long long i) {
+            auto worker2 = [&](long long i)
+            {
                 const MolecularDescriptors *d = fm.descriptor(cands[i].g);
                 if (!d)
                     return;
@@ -194,7 +212,8 @@ public:
             const float pddLim = lim(p.pddFactor);
             std::vector<char> keep(cands.size(), 0);
 
-            auto worker3 = [&](long long i) {
+            auto worker3 = [&](long long i)
+            {
                 const MolecularDescriptors *d = fm.descriptor(cands[i].g);
                 float v = 0.f;
                 if (d && pddCheck(q.pdd, d->pdd, n, pddLim, v))
@@ -224,7 +243,7 @@ public:
         t0 = omp_get_wtime();
         {
             std::vector<CloudAlignmentEvaluator::Point3F> cloudQ = toCloud(qAtoms);
-           AlignmentOptions opt;
+            AlignmentOptions opt;
             opt.exact = p.exactDistance;
             opt.acceptDistance = p.exactDistance ? 0.0f : lim(p.alignFactor);
             opt.refineIterations = p.refineIterations;
@@ -233,7 +252,8 @@ public:
             std::vector<DupMatch> slots(cands.size());
             std::vector<char> ok(cands.size(), 0);
 
-            auto worker4 = [&](long long i) {
+            auto worker4 = [&](long long i)
+            {
                 const auto &cAtoms = getAtoms(cands[i].g);
                 AlignmentResult res = CloudAlignmentEvaluator::alignAndEvaluate(cloudQ, toCloud(cAtoms), opt);
                 if (!res.success || res.bestBottleneck > accept)
@@ -288,8 +308,8 @@ public:
     // Batch runner for ALL indices in parallel, accumulating evaluation counts and timings
     template <class GetAtoms, class GetLabel = DefaultGetLabel>
     std::vector<DupMatch> runAll(const FaissIndexManager &fm, size_t totalMols,
-                                  GetAtoms getAtoms, GetLabel getLabel, const DupCheckParams &p,
-                                  DupRunStats &stTotal) const
+                                 GetAtoms getAtoms, GetLabel getLabel, const DupCheckParams &p,
+                                 DupRunStats &stTotal) const
     {
         std::vector<DupMatch> allMatches;
         std::mutex matchMutex;
@@ -309,7 +329,7 @@ public:
         double accumMsPdd = 0.0;
         double accumMsAlign = 0.0;
 
-#pragma omp parallel for schedule(dynamic, 4) num_threads(nt) reduction(+:accumSrvCount, accumSdvCount, accumPddCount, accumAlignCount, accumMsSrv, accumMsSdv, accumMsPdd, accumMsAlign)
+#pragma omp parallel for schedule(dynamic, 4) num_threads(nt) reduction(+ : accumSrvCount, accumSdvCount, accumPddCount, accumAlignCount, accumMsSrv, accumMsSdv, accumMsPdd, accumMsAlign)
         for (long long i = 0; i < static_cast<long long>(totalMols); ++i)
         {
             const auto *desc = fm.descriptor(i);
@@ -363,9 +383,8 @@ public:
         stTotal.batchMsPdd = accumMsPdd;
         stTotal.batchMsAlign = accumMsAlign;
 
-        std::sort(allMatches.begin(), allMatches.end(), [](const DupMatch &a, const DupMatch &b) {
-            return a.alignBottleneck < b.alignBottleneck;
-        });
+        std::sort(allMatches.begin(), allMatches.end(), [](const DupMatch &a, const DupMatch &b)
+                  { return a.alignBottleneck < b.alignBottleneck; });
 
         stTotal.afterAlign = allMatches.size();
         return allMatches;
@@ -408,14 +427,24 @@ public:
         else
         {
             std::cout << "  " << m.size() << " DUPLICATE(S) FOUND:\n"
-                      << "  " << std::left << std::setw(7) << "match" << std::setw(11) << "align"
-                      << std::setw(11) << "pdd" << std::setw(11) << "sdv" << std::setw(11) << "srv"
-                      << "species_mismatch\n";
+                      << "  " << std::left << std::setw(8) << "MolA"
+                      << std::setw(8) << "MolB"
+                      << std::setw(10) << "Atoms"
+                      << std::setw(11) << "align"
+                      << std::setw(11) << "pdd"
+                      << std::setw(11) << "sdv"
+                      << std::setw(11) << "srv"
+                      << "mismatch\n";
             const size_t lim = std::min<size_t>(m.size(), 15);
             for (size_t i = 0; i < lim; ++i)
-                std::cout << "  " << std::left << std::setw(7) << m[i].matchIdx << std::setprecision(6)
-                          << std::setw(11) << m[i].alignBottleneck << std::setw(11) << m[i].pddBottleneck
-                          << std::setw(11) << m[i].sdvLinf << std::setw(11) << m[i].srvLinf
+                std::cout << "  " << std::left << std::setw(8) << m[i].queryIdx
+                          << std::setw(8) << m[i].matchIdx
+                          << std::setw(10) << m[i].numAtoms
+                          << std::setprecision(6)
+                          << std::setw(11) << m[i].alignBottleneck
+                          << std::setw(11) << m[i].pddBottleneck
+                          << std::setw(11) << m[i].sdvLinf
+                          << std::setw(11) << m[i].srvLinf
                           << m[i].speciesMismatches << "\n";
             if (m.size() > lim)
                 std::cout << "  ... " << (m.size() - lim) << " more\n";
@@ -425,10 +454,11 @@ public:
 
     // Prints batch summary table with counts and % stage time breakdown for all-indices run
     static void printBatchReport(const DupCheckParams &p, const DupRunStats &s,
-                                   const std::vector<DupMatch> &m, const std::string &csvPath)
+                                 const std::vector<DupMatch> &m, const std::string &csvPath)
     {
         double sumStageMs = s.batchMsSrv + s.batchMsSdv + s.batchMsPdd + s.batchMsAlign;
-        if (sumStageMs < 1e-3) sumStageMs = 1.0;
+        if (sumStageMs < 1e-3)
+            sumStageMs = 1.0;
 
         std::cout << "\n=======================================================\n"
                   << "  ALL-INDICES DUPLICATE CHECK BATCH SUMMARY\n"
@@ -441,13 +471,13 @@ public:
                   << "  CSV Export Path     : " << csvPath << "\n"
                   << "-------------------------------------------------------\n"
                   << "  STAGE EXECUTION STATS & TIMINGS:\n"
-                  << "    1. SRV Range Searches : " << std::setw(8) << s.batchSrvCount << " queries | " 
+                  << "    1. SRV Range Searches : " << std::setw(8) << s.batchSrvCount << " queries | "
                   << std::setw(8) << s.batchMsSrv << " ms (" << std::setprecision(1) << (s.batchMsSrv / sumStageMs) * 100.0 << "%)\n"
-                  << "    2. SDV Evaluations    : " << std::setw(8) << s.batchSdvCount << " pairs   | " 
+                  << "    2. SDV Evaluations    : " << std::setw(8) << s.batchSdvCount << " pairs   | "
                   << std::setw(8) << s.batchMsSdv << " ms (" << (s.batchMsSdv / sumStageMs) * 100.0 << "%)\n"
-                  << "    3. PDD Evaluations    : " << std::setw(8) << s.batchPddCount << " pairs   | " 
+                  << "    3. PDD Evaluations    : " << std::setw(8) << s.batchPddCount << " pairs   | "
                   << std::setw(8) << s.batchMsPdd << " ms (" << (s.batchMsPdd / sumStageMs) * 100.0 << "%)\n"
-                  << "    4. Aligned Evaluations: " << std::setw(8) << s.batchAlignCount << " pairs   | " 
+                  << "    4. Aligned Evaluations: " << std::setw(8) << s.batchAlignCount << " pairs   | "
                   << std::setw(8) << s.batchMsAlign << " ms (" << (s.batchMsAlign / sumStageMs) * 100.0 << "%)\n"
                   << "-------------------------------------------------------\n";
         if (m.empty())
@@ -457,18 +487,25 @@ public:
         else
         {
             std::cout << "  TOP DUPLICATE PAIRS (Sorted by Aligner Distance):\n"
-                      << "  " << std::left << std::setw(10) << "MolA"
-                      << std::setw(10) << "MolB"
-                      << std::setw(12) << "NumAtoms"
-                      << std::setw(15) << "AlignerDist"
-                      << "SpeciesMismatch\n";
+                      << "  " << std::left << std::setw(8) << "MolA"
+                      << std::setw(8) << "MolB"
+                      << std::setw(10) << "Atoms"
+                      << std::setw(11) << "align"
+                      << std::setw(11) << "pdd"
+                      << std::setw(11) << "sdv"
+                      << std::setw(11) << "srv"
+                      << "mismatch\n";
             size_t lim = std::min<size_t>(m.size(), 20);
             for (size_t i = 0; i < lim; ++i)
             {
-                std::cout << "  " << std::left << std::setw(10) << m[i].queryIdx
-                          << std::setw(10) << m[i].matchIdx
-                          << std::setw(12) << m[i].numAtoms
-                          << std::setw(15) << std::setprecision(6) << m[i].alignBottleneck
+                std::cout << "  " << std::left << std::setw(8) << m[i].queryIdx
+                          << std::setw(8) << m[i].matchIdx
+                          << std::setw(10) << m[i].numAtoms
+                          << std::setprecision(6)
+                          << std::setw(11) << m[i].alignBottleneck
+                          << std::setw(11) << m[i].pddBottleneck
+                          << std::setw(11) << m[i].sdvLinf
+                          << std::setw(11) << m[i].srvLinf
                           << m[i].speciesMismatches << "\n";
             }
             if (m.size() > lim)

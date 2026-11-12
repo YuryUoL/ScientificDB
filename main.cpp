@@ -80,10 +80,20 @@ int main(int argc, char *argv[])
 {
     std::cout << "Initializing Polyscope GUI...\n";
     PolyscopeBridge::init();
+
+
+    
     MatchingViz::install();
 
     MolecularDatasetStore xyzStore;
     CommandDispatcher ui;
+
+      // Register the ImGui window callback here
+    PolyscopeBridge::s_extraUserCallback = [&]() {
+        std::vector<std::string> filenames(xyzStore.size());
+        std::vector<size_t> atomCounts(xyzStore.size());
+        MolecularGraphViz::drawImGuiWindow(filenames, atomCounts);
+    };
 
     // ==========================================
     // 1. DATASET MANAGEMENT & INSPECTION
@@ -129,6 +139,58 @@ int main(int argc, char *argv[])
                 std::cout << "[XyzStore] Error: Path does not exist or is invalid: " << path << "\n";
             }
         });
+
+    // Register Command: loadAndCompute <file_or_folder>
+    ui.registerCommand(
+        "loadAndCompute", "<path_to_file_or_folder>",
+        "Loads single .xyz file or folder and automatically computes all descriptors.",
+        [&](std::istringstream &iss)
+        {
+            std::string path;
+            iss >> std::ws;
+            if (iss.peek() == '\'' || iss.peek() == '"')
+            {
+                char quote = iss.get();
+                std::getline(iss, path, quote);
+            }
+            else
+            {
+                iss >> path;
+            }
+
+            if (path.empty())
+            {
+                std::cout << "Usage: loadAndCompute <file_or_folder_path>\n";
+                return;
+            }
+            namespace fs = std::filesystem;
+            bool loaded = false;
+            if (fs::is_directory(path))
+            {
+                xyzStore.addFolder(path);
+                loaded = true;
+            }
+            else if (fs::is_regular_file(path))
+            {
+                if (xyzStore.addFile(path))
+                {
+                    std::cout << "[XyzStore] Successfully loaded 1 file into host RAM.\n";
+                    loaded = true;
+                }
+            }
+            else
+            {
+                std::cout << "[XyzStore] Error: Path does not exist or is invalid: " << path << "\n";
+            }
+
+            if (loaded)
+            {
+                std::cout << "[XyzStore] Automatically computing descriptors...\n";
+                xyzStore.computeDescriptors();
+            }
+        });
+    ui.registerAlias("load_and_compute", "loadAndCompute");
+    ui.registerAlias("loadCompute", "loadAndCompute");
 
     // Register Command: ShowAll [limit]
     ui.registerCommand(
@@ -355,7 +417,6 @@ int main(int argc, char *argv[])
         });
     ui.registerAlias("knnAll", "knn_all");
 
-
     ui.registerCommand(
         "pair_dist", "<index1> <index2> [metric: srv/sdv/pdd/aligner] [key=val ...]",
         "Computes exact distance metric or full rigid alignment with bottleneck distance and point matching.\n"
@@ -392,7 +453,7 @@ int main(int argc, char *argv[])
                 }
                 else
                 {
-                          auto tStart = std::chrono::high_resolution_clock::now();
+                    auto tStart = std::chrono::high_resolution_clock::now();
                     float dist = xyzStore.computePairMetric(idx1, idx2, metric);
                     auto tEnd = std::chrono::high_resolution_clock::now();
                     double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
@@ -416,9 +477,6 @@ int main(int argc, char *argv[])
             }
         });
 
-    // Register Command: pair_dist <idx1> <idx2> [metric]
-   // Register Command: pair_dist <idx1> <idx2> [metric] [key=val ...]
-   
     ui.registerAlias("pairDist", "pair_dist");
     ui.registerAlias("dist_pair", "pair_dist");
 
@@ -466,7 +524,7 @@ int main(int argc, char *argv[])
                        [&](std::istringstream &)
                        { MatchingViz::clearAll(); });
 
-     ui.registerCommand("show_matches", "", "Shows all stored matchings.",
+    ui.registerCommand("show_matches", "", "Shows all stored matchings.",
                        [&](std::istringstream &)
                        { xyzStore.setAllMatchesVisible(true); });
     ui.registerCommand("hide_matches", "", "Hides all stored matchings.",
@@ -477,7 +535,7 @@ int main(int argc, char *argv[])
     // 5. SYSTEM & GENERAL COMMANDS
     // ==========================================
 
-   // Register Command: dup_check <index|all> [epsilon|csv_file] [key=val ...]
+    // Register Command: dup_check <index|all> [epsilon|csv_file] [key=val ...]
     ui.registerCommand(
         "dup_check", "<index|all> [epsilon|csv_file] [key=val ...]",
         "Checks if molecule <index> or ALL molecules are duplicates against the DB.\n"
@@ -511,10 +569,8 @@ int main(int argc, char *argv[])
             if (arg1 == "all")
             {
                 std::string csvPath = "duplicates.csv";
-                if (!(iss >> csvPath))
-                    csvPath = "duplicates.csv";
-
                 DupCheckParams p;
+
                 std::string token;
                 while (iss >> token)
                 {
@@ -525,13 +581,25 @@ int main(int argc, char *argv[])
                     }
                     else
                     {
-                        try {
-                            p.epsilon = std::stof(token);
-                        } catch (...) {}
+                        if (token.find('/') != std::string::npos ||
+                            token.find('\\') != std::string::npos ||
+                            token.find(".csv") != std::string::npos)
+                        {
+                            csvPath = token;
+                        }
+                        else
+                        {
+                            try
+                            {
+                                p.epsilon = std::stof(token);
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
                     }
                 }
 
-                // -> PRINT PARAMETERS IMMEDIATELY HERE <-
                 std::cout << "\n[DupCheck] Running batch duplicate check with parameters:\n"
                           << "  epsilon    : " << p.epsilon << "\n"
                           << "  exact      : " << (p.exactDistance ? "1 (optimal)" : "0 (early-exit)") << "\n"
@@ -541,7 +609,8 @@ int main(int argc, char *argv[])
                           << "  pddf       : " << p.pddFactor << "\n"
                           << "  refine     : " << p.refineIterations << "\n"
                           << "  threads    : " << (p.numThreads > 0 ? p.numThreads : omp_get_max_threads()) << "\n"
-                          << "  csvOutput  : " << csvPath << "\n\n" << std::flush;
+                          << "  csvOutput  : " << csvPath << "\n\n"
+                          << std::flush;
 
                 DupRunStats st;
                 auto matches = xyzStore.runBatchDuplicateCheck(csvPath, p, st);
@@ -550,36 +619,83 @@ int main(int argc, char *argv[])
             else
             {
                 size_t idx = std::stoul(arg1);
+                std::string csvPath = "";
                 DupCheckParams p;
-                if (iss >> std::ws && iss.peek() != EOF)
+
+                std::string token;
+                while (iss >> token)
                 {
-                    std::string token;
-                    iss >> token;
-                    try {
-                        p.epsilon = std::stof(token);
-                    } catch (...) {
-                        size_t eq = token.find('=');
-                        if (eq != std::string::npos) {
-                            p.set(token.substr(0, eq), token.substr(eq + 1));
+                    size_t eq = token.find('=');
+                    if (eq != std::string::npos)
+                    {
+                        p.set(token.substr(0, eq), token.substr(eq + 1));
+                    }
+                    else
+                    {
+                        if (token.find('/') != std::string::npos ||
+                            token.find('\\') != std::string::npos ||
+                            token.find(".csv") != std::string::npos)
+                        {
+                            csvPath = token;
+                        }
+                        else
+                        {
+                            try
+                            {
+                                p.epsilon = std::stof(token);
+                            }
+                            catch (...)
+                            {
+                            }
                         }
                     }
                 }
-                std::string kVal;
-                while (iss >> kVal) {
-                    size_t eq = kVal.find('=');
-                    if (eq != std::string::npos) {
-                        p.set(kVal.substr(0, eq), kVal.substr(eq + 1));
-                    }
-                }
+
                 DupRunStats st;
-                auto matches = xyzStore.runDuplicateCheck(idx, p, st);
+                auto matches = xyzStore.runDuplicateCheck(idx, csvPath, p, st);
                 DuplicateChecker::printReport(idx, p, st, matches);
             }
         });
     ui.registerAlias("duplicateCheck", "dup_check");
     ui.registerAlias("dupCheck", "dup_check");
 
-    
+    ui.registerCommand(
+    "explore_clusters", "",
+    "Computes connected components from the last duplicate check and opens an interactive table window.",
+    [&](std::istringstream &)
+    {
+        xyzStore.exploreClusters();
+    });
+ui.registerAlias("clusters", "explore_clusters");
+
+    // Register Command: show_graph / hide_graph
+    ui.registerCommand(
+        "show_graph", "",
+        "Shows the duplicate network graph in Polyscope.",
+        [&](std::istringstream &)
+        {
+            xyzStore.setGraphVisible(true);
+            std::cout << "[Polyscope] Duplicate graph shown.\n";
+        });
+
+    ui.registerCommand(
+        "hide_graph", "",
+        "Hides the duplicate network graph in Polyscope.",
+        [&](std::istringstream &)
+        {
+            xyzStore.setGraphVisible(false);
+            std::cout << "[Polyscope] Duplicate graph hidden.\n";
+        });
+
+    // Register Command: clear_graph
+    ui.registerCommand(
+        "clear_graph", "",
+        "Removes the duplicate network graph and its labels from Polyscope.",
+        [&](std::istringstream &)
+        {
+            xyzStore.clearGraph();
+        });
+    ui.registerAlias("rm_graph", "clear_graph");
 
     // Register Command: help
     ui.registerCommand("help", "", "Displays this command usage reference.",
@@ -599,14 +715,28 @@ int main(int argc, char *argv[])
     if (argc >= 2)
     {
         std::string initialPath = argv[1];
+        bool autoCompute = (argc >= 3 && (std::string(argv[2]) == "--compute" || std::string(argv[2]) == "-c"));
+
         namespace fs = std::filesystem;
+        bool loaded = false;
         if (fs::is_directory(initialPath))
         {
             xyzStore.addFolder(initialPath);
+            loaded = true;
         }
         else if (fs::is_regular_file(initialPath))
         {
-            xyzStore.addFile(initialPath);
+            if (xyzStore.addFile(initialPath))
+            {
+                std::cout << "[XyzStore] Successfully loaded 1 file into host RAM.\n";
+                loaded = true;
+            }
+        }
+
+        if (loaded && autoCompute)
+        {
+            std::cout << "[XyzStore] Automatically computing descriptors on startup...\n";
+            xyzStore.computeDescriptors();
         }
     }
 
@@ -643,8 +773,6 @@ int main(int argc, char *argv[])
             g_cmdCV.notify_one();
         }
 
-        // Keep Polyscope responsive continuously
-       // MatchingViz::update();
         PolyscopeBridge::drawFrame();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
