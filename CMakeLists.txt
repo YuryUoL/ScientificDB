@@ -7,6 +7,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Optional MariaDB Integration
+option(ENABLE_MYSQL "Enable MariaDB database integration" OFF)
+set(MARIADB_DIR "$ENV{HOME}/Projects/CPPProj/MariaDB" CACHE PATH "Path to MariaDB source/build root")
+
 include(FetchContent)
 
 # 1. Fetch Chemfiles
@@ -48,6 +52,7 @@ find_package(TBB REQUIRED)
 
 # Include paths for system-installed FAISS and CUDA headers
 include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}
     /usr/local/include
     /usr/local/cuda/include
 )
@@ -72,3 +77,46 @@ target_link_libraries(ScientificDB PRIVATE
     OpenMP::OpenMP_CXX
     TBB::tbb
 )
+
+# Configure MariaDB if enabled
+# Configure MariaDB if enabled
+# Configure MariaDB if enabled
+if(ENABLE_MYSQL)
+    # Locate libmariadb across the actual nested source-build output paths
+    find_library(MARIADB_CLIENT_LIB
+        NAMES mariadb mariadbclient mysqlclient
+        PATHS 
+            "${MARIADB_DIR}/build/libmariadb/libmariadb"
+            "${MARIADB_DIR}/build/libmariadb"
+            "${MARIADB_DIR}/lib"
+            "${MARIADB_DIR}/lib64"
+        PATH_SUFFIXES Release Debug
+    )
+    
+    # Fallback to system-wide search if still not found
+    if(NOT MARIADB_CLIENT_LIB)
+        find_library(MARIADB_CLIENT_LIB NAMES mariadb mariadbclient mysqlclient REQUIRED)
+    endif()
+
+    target_compile_definitions(ScientificDB PRIVATE USE_MYSQL=1)
+    target_include_directories(ScientificDB PRIVATE
+        "${MARIADB_DIR}/libmariadb/include"
+        "${MARIADB_DIR}/build/libmariadb/include"
+        "${MARIADB_DIR}/include"
+        "${MARIADB_DIR}/build/include"
+        "${MARIADB_DIR}/libmariadb"
+    )
+    target_link_libraries(ScientificDB PRIVATE ${MARIADB_CLIENT_LIB})
+
+    # Embed RPATH so the binary finds libmariadb.so at runtime without LD_LIBRARY_PATH
+    get_filename_component(MARIADB_LIB_DIR "${MARIADB_CLIENT_LIB}" DIRECTORY)
+    set_target_properties(ScientificDB PROPERTIES
+        BUILD_RPATH "${MARIADB_LIB_DIR}"
+        INSTALL_RPATH "${MARIADB_LIB_DIR}"
+    )
+
+    message(STATUS "[ScientificDB] MariaDB support ENABLED using: ${MARIADB_CLIENT_LIB}")
+else()
+    target_compile_definitions(ScientificDB PRIVATE USE_MYSQL=0)
+    message(STATUS "[ScientificDB] MariaDB support DISABLED (offline mode).")
+endif()

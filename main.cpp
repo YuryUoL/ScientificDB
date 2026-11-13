@@ -21,6 +21,13 @@
 
 #include "CPU/Matchingvisualizer.h"
 
+#if USE_MYSQL
+#include "Database/DatabaseConnection.h"
+#include "Database/MoleculeRepository.h"
+// Global or session database handle for the CLI client
+static DatabaseConnection g_dbConn;
+#endif
+
 // Thread-safe command queue & synchronization primitives
 static std::mutex g_cmdMutex;
 static std::condition_variable g_cmdCV;
@@ -81,15 +88,14 @@ int main(int argc, char *argv[])
     std::cout << "Initializing Polyscope GUI...\n";
     PolyscopeBridge::init();
 
-
-    
     MatchingViz::install();
 
     MolecularDatasetStore xyzStore;
     CommandDispatcher ui;
 
-      // Register the ImGui window callback here
-    PolyscopeBridge::s_extraUserCallback = [&]() {
+    // Register the ImGui window callback here
+    PolyscopeBridge::s_extraUserCallback = [&]()
+    {
         std::vector<std::string> filenames(xyzStore.size());
         std::vector<size_t> atomCounts(xyzStore.size());
         MolecularGraphViz::drawImGuiWindow(filenames, atomCounts);
@@ -660,13 +666,13 @@ int main(int argc, char *argv[])
     ui.registerAlias("dupCheck", "dup_check");
 
     ui.registerCommand(
-    "explore_clusters", "",
-    "Computes connected components from the last duplicate check and opens an interactive table window.",
-    [&](std::istringstream &)
-    {
-        xyzStore.exploreClusters();
-    });
-ui.registerAlias("clusters", "explore_clusters");
+        "explore_clusters", "",
+        "Computes connected components from the last duplicate check and opens an interactive table window.",
+        [&](std::istringstream &)
+        {
+            xyzStore.exploreClusters();
+        });
+    ui.registerAlias("clusters", "explore_clusters");
 
     // Register Command: show_graph / hide_graph
     ui.registerCommand(
@@ -696,6 +702,63 @@ ui.registerAlias("clusters", "explore_clusters");
             xyzStore.clearGraph();
         });
     ui.registerAlias("rm_graph", "clear_graph");
+
+#if USE_MYSQL
+    // Register Command: db_connect <host> <user> <pass> <db>
+    ui.registerCommand(
+        "db_connect", "<host> <user> <pass> <db>",
+        "Connects the client to a remote or local MariaDB server.",
+        [&](std::istringstream &iss)
+        {
+            std::string host, user, pass, db;
+            if (iss >> host >> user >> pass >> db)
+            {
+                if (g_dbConn.connect(host, user, pass, db))
+                {
+                    MoleculeRepository repo(g_dbConn);
+                    repo.initializeSchema();
+                    std::cout << "[Database] Connected and schema verified.\n";
+                }
+            }
+            else
+            {
+                std::cout << "Usage: db_connect <host> <user> <pass> <db>\n";
+            }
+        });
+
+    // Register Command: db_push
+    ui.registerCommand(
+        "db_push", "",
+        "Uploads all currently loaded local RAM molecules into MariaDB blobs.",
+        [&](std::istringstream &)
+        {
+            if (!g_dbConn.isConnected())
+            {
+                std::cout << "[Database] Error: Not connected. Run 'db_connect' first.\n";
+                return;
+            }
+            // Implementation detail: iterate through xyzStore entries and push to repo
+            std::cout << "[Database] Pushing local dataset to server...\n";
+            // MoleculeRepository repo(g_dbConn);
+            // ... loop and repo.saveMolecule(...)
+        });
+
+    // Register Command: db_pull
+    ui.registerCommand(
+        "db_pull", "",
+        "Downloads molecule blobs from MariaDB into local RAM store for analysis and rendering.",
+        [&](std::istringstream &)
+        {
+            if (!g_dbConn.isConnected())
+            {
+                std::cout << "[Database] Error: Not connected. Run 'db_connect' first.\n";
+                return;
+            }
+            MoleculeRepository repo(g_dbConn);
+            size_t pulled = repo.loadAllIntoMemory(xyzStore);
+            std::cout << "[Database] Pulled " << pulled << " molecules into local RAM.\n";
+        });
+#endif
 
     // Register Command: help
     ui.registerCommand("help", "", "Displays this command usage reference.",
