@@ -20,6 +20,9 @@
 #include "CPU/PolyscopeBridge.h"
 
 #include "CPU/Matchingvisualizer.h"
+#include "CPU/SyntheticMoleculeGenerator.h"
+
+#include "CPU/DatasetBrowserViz.h"
 
 #if USE_MYSQL
 #include "Database/DatabaseConnection.h"
@@ -96,9 +99,16 @@ int main(int argc, char *argv[])
     // Register the ImGui window callback here
     PolyscopeBridge::s_extraUserCallback = [&]()
     {
+        // Toggle checkbox for the browser window in Polyscope UI
+        ImGui::Checkbox("Dataset Browser", &DatasetBrowserViz::s_windowVisible);
+
+        // Existing cluster graph window
         std::vector<std::string> filenames(xyzStore.size());
         std::vector<size_t> atomCounts(xyzStore.size());
         MolecularGraphViz::drawImGuiWindow(filenames, atomCounts);
+
+        // Render the dataset browser table window
+        DatasetBrowserViz::drawWindow(xyzStore);
     };
 
     // ==========================================
@@ -726,27 +736,111 @@ int main(int argc, char *argv[])
             }
         });
 
-    // Register Command: db_push
+    // Register Command: db_disconnect
     ui.registerCommand(
-        "db_push", "",
-        "Uploads all currently loaded local RAM molecules into MariaDB blobs.",
+        "db_disconnect", "",
+        "Disconnects the client from the active MariaDB server.",
         [&](std::istringstream &)
+        {
+            if (!g_dbConn.isConnected())
+            {
+                std::cout << "[Database] Not currently connected to any server.\n";
+                return;
+            }
+            g_dbConn.disconnect();
+        });
+    ui.registerAlias("db_quit", "db_disconnect");
+
+    // Register Command: db_push [include_descriptors: 0/1]
+    // Register Command: db_push [include_descriptors: 0/1]
+    ui.registerCommand(
+        "db_push", "[include_descriptors: 0/1]",
+        "Uploads all currently loaded local RAM molecules into MariaDB blobs (optionally with descriptors).",
+        [&](std::istringstream &iss)
         {
             if (!g_dbConn.isConnected())
             {
                 std::cout << "[Database] Error: Not connected. Run 'db_connect' first.\n";
                 return;
             }
-            // Implementation detail: iterate through xyzStore entries and push to repo
-            std::cout << "[Database] Pushing local dataset to server...\n";
-            // MoleculeRepository repo(g_dbConn);
-            // ... loop and repo.saveMolecule(...)
+
+            int includeDesc = 1;
+            iss >> includeDesc;
+
+            std::cout << "[Database] Pushing local dataset to server (Descriptors: " << (includeDesc ? "Yes" : "No") << ")...\n";
+            MoleculeRepository repo(g_dbConn);
+
+            // START TRANSACTION FOR BLISTERING SPEED
+            if (!repo.beginTransaction())
+            {
+                std::cerr << "[Database] Failed to start transaction.\n";
+                return;
+            }
+
+            size_t successCount = 0;
+            size_t total = xyzStore.size();
+
+            for (size_t i = 0; i < total; ++i)
+            {
+                std::string filename = xyzStore.getFilename(i);
+                std::string rawXyz = xyzStore.getRawContent(i);
+                std::string comment = xyzStore.getComment(i);
+                size_t atomCount = xyzStore.getAtomCount(i);
+
+                std::vector<float> sdv, srv, pdd;
+                if (includeDesc)
+                {
+                    sdv = xyzStore.getSDV(i);
+                    srv = xyzStore.getSRV(i);
+                    pdd = xyzStore.getPDD(i);
+                }
+
+                if (repo.saveMolecule(filename, atomCount, comment, rawXyz, sdv, srv, pdd))
+                {
+                    successCount++;
+                }
+
+                if ((i + 1) % 5000 == 0 || i + 1 == total)
+                {
+                    std::cout << "\r[Database] Progress: " << (i + 1) << " / " << total << " molecules pushed..." << std::flush;
+                }
+            }
+
+            // COMMIT THE TRANSACTION
+            if (successCount == total)
+            {
+                repo.commit();
+                std::cout << "\n[Database] Successfully pushed and committed " << successCount << " / " << total << " molecules to MariaDB.\n";
+            }
+            else
+            {
+                repo.rollback();
+                std::cout << "\n[Database] Error during push. Transaction rolled back.\n";
+            }
         });
 
-    // Register Command: db_pull
+    // Register Command: db_pull [include_descriptors: 0/1]
     ui.registerCommand(
-        "db_pull", "",
+        "db_pull", "[include_descriptors: 0/1]",
         "Downloads molecule blobs from MariaDB into local RAM store for analysis and rendering.",
+        [&](std::istringstream &iss)
+        {
+            if (!g_dbConn.isConnected())
+            {
+                std::cout << "[Database] Error: Not connected. Run 'db_connect' first.\n";
+                return;
+            }
+            int includeDesc = 1;
+            iss >> includeDesc;
+
+            MoleculeRepository repo(g_dbConn);
+            size_t pulled = repo.loadAllIntoMemory(xyzStore, (includeDesc != 0));
+            std::cout << "[Database] Pulled " << pulled << " molecules into local RAM.\n";
+        });
+    // Register Command: db_clear
+    ui.registerCommand(
+        "db_clear", "",
+        "Truncates and clears all molecules stored in the active MariaDB database.",
         [&](std::istringstream &)
         {
             if (!g_dbConn.isConnected())
@@ -754,11 +848,39 @@ int main(int argc, char *argv[])
                 std::cout << "[Database] Error: Not connected. Run 'db_connect' first.\n";
                 return;
             }
+
             MoleculeRepository repo(g_dbConn);
-            size_t pulled = repo.loadAllIntoMemory(xyzStore);
-            std::cout << "[Database] Pulled " << pulled << " molecules into local RAM.\n";
+            if (repo.clearDatabase())
+            {
+                std::cout << "[Database] Successfully truncated and cleared all molecules from MariaDB.\n";
+            }
         });
 #endif
+
+    // Register Command: generate [base_count] [copies_per_base] [noise_sigma]
+    ui.registerCommand(
+        "generate", "[base_count] [copies_per_base] [min_atoms] [max_atoms] [noise_sigma]",
+        "Generates synthetic QM9-like molecules with configurable size range, isometric copies, and noise.",
+        [&](std::istringstream &iss)
+        {
+            size_t baseMols = 50;
+            size_t copies = 3;
+            size_t minAtoms = 5;
+            size_t maxAtoms = 25;
+            float noise = 0.01f;
+
+            iss >> baseMols >> copies >> minAtoms >> maxAtoms >> noise;
+            SyntheticMoleculeGenerator::generate(xyzStore, baseMols, copies, minAtoms, maxAtoms, noise);
+        });
+
+    ui.registerCommand("browser", "<on/off>", "Shows or hides the dataset browser window.", [&](std::istringstream &iss)
+                       {
+    std::string state;
+    if (iss >> state) {
+        DatasetBrowserViz::s_windowVisible = (state == "on" || state == "1");
+    } else {
+        std::cout << "Dataset Browser is currently: " << (DatasetBrowserViz::s_windowVisible ? "ON" : "OFF") << "\n";
+    } });
 
     // Register Command: help
     ui.registerCommand("help", "", "Displays this command usage reference.",

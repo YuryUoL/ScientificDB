@@ -82,6 +82,64 @@ public:
         m_entries.push_back(std::move(mol));
         return true;
     }
+
+    // Parses a raw XYZ string content directly into a molecule entry in RAM
+    bool addStringContent(const std::string& filename, const std::string& content)
+    {
+        std::istringstream file(content);
+        std::string line;
+        if (!std::getline(file, line))
+            return false;
+
+        int numAtoms = 0;
+        try {
+            numAtoms = std::stoi(line);
+        } catch (...) {
+            return false;
+        }
+
+        if (!std::getline(file, line))
+            return false;
+        std::string comment = line;
+
+        MoleculeEntry mol;
+        mol.id = m_nextId++;
+        mol.filename = filename;
+        mol.commentLine = comment;
+        mol.atoms.reserve(numAtoms);
+
+        for (int i = 0; i < numAtoms; ++i)
+        {
+            if (!std::getline(file, line))
+                break;
+            std::istringstream iss(line);
+            AtomRecord atom;
+            if (iss >> atom.symbol >> atom.x >> atom.y >> atom.z)
+            {
+                if (!(iss >> atom.charge)) {
+                    atom.charge = 0.0;
+                }
+                mol.atoms.push_back(atom);
+            }
+        }
+
+        mol.numAtoms = mol.atoms.size();
+        m_entries.push_back(std::move(mol));
+        return true;
+    }
+
+    // Allows direct insertion of programmatically generated molecules
+    size_t addSyntheticEntry(const std::string& filename, const std::string& comment, const std::vector<AtomRecord>& atoms) {
+        MoleculeEntry mol;
+        mol.id = m_nextId++;
+        mol.filename = filename;
+        mol.commentLine = comment;
+        mol.atoms = atoms;
+        mol.numAtoms = atoms.size();
+        m_entries.push_back(std::move(mol));
+        return m_entries.size();
+    }
+
     std::vector<DupMatch> runDuplicateCheck(size_t queryIdx, const std::string &csvPath, const DupCheckParams &p, DupRunStats &st)
     {
         DuplicateChecker checker;
@@ -112,7 +170,6 @@ public:
             p,
             st);
 
-        // Store matchings for visualization
         for (const auto &m : matches)
         {
             const auto &molA = m_entries[m.queryIdx];
@@ -120,7 +177,6 @@ public:
             MatchingViz::store(molA.id, molB.id, molA.filename, molB.filename, m.align);
         }
 
-        // Write CSV if path provided
         if (!csvPath.empty() && !matches.empty())
         {
             std::ofstream csv(csvPath);
@@ -145,6 +201,7 @@ public:
 
         return matches;
     }
+
     std::vector<DupMatch> runBatchDuplicateCheck(const std::string &csvPath, const DupCheckParams &p, DupRunStats &st)
     {
         DuplicateChecker checker;
@@ -166,7 +223,6 @@ public:
             p,
             st);
 
-        // Store all valid matchings and rotations in RAM for visualization / alignment application
         for (const auto &m : matches)
         {
             const auto &molA = m_entries[m.queryIdx];
@@ -174,7 +230,6 @@ public:
             MatchingViz::store(molA.id, molB.id, molA.filename, molB.filename, m.align);
         }
 
-        // Write sorted CSV summary
         if (!csvPath.empty())
         {
             std::ofstream csv(csvPath);
@@ -198,7 +253,6 @@ public:
         }
 
         m_lastBatchMatches = matches;
-
         return matches;
     }
 
@@ -211,7 +265,6 @@ public:
             return 0;
         }
 
-        // 1. Collect and sort file paths alphabetically/numerically
         std::vector<std::string> filePaths;
         for (const auto &entry : fs::directory_iterator(folderpath))
         {
@@ -235,7 +288,6 @@ public:
         size_t count = 0;
         auto tStart = std::chrono::high_resolution_clock::now();
 
-        // 2. Load files with a progress bar update
         for (size_t i = 0; i < totalFiles; ++i)
         {
             if (addFile(filePaths[i]))
@@ -243,7 +295,6 @@ public:
                 count++;
             }
 
-            // Print progress bar every 50 files or at completion
             if ((i + 1) % 50 == 0 || (i + 1) == totalFiles)
             {
                 printProgressBar(i + 1, totalFiles);
@@ -258,13 +309,11 @@ public:
         return count;
     }
 
-    // [UPDATED] Pass string kStr (to support numbers like "10" or percentages like "10%") and restrictToLast flag for chaining
     bool searchKNN(size_t index, const std::string &kStr, const std::string &metricType, const std::string &csvPath = "", bool restrictToLast = false) const
     {
         return m_faissManager.searchKNN(index, kStr, metricType, csvPath, restrictToLast);
     }
 
-    // [NEW] Added wrapper for printing distance distribution stats, histogram, and outliers
     void printDistanceDistribution() const
     {
         m_faissManager.printDistanceDistribution();
@@ -322,36 +371,6 @@ public:
 
         MatchingViz::store(molA.id, molB.id, molA.filename, molB.filename, res);
         std::cout << "[Matching] Stored (hidden). Use 'show_match <a> <b>' to display it.\n";
-
-        std::cout << "\n=======================================================\n";
-        std::cout << "          CLOUD ALIGNMENT & BOTTLENECK MATCHING        \n";
-        std::cout << "=======================================================\n";
-        std::cout << "  Molecule A Index : " << idxA << " (" << molA.filename << ")\n";
-        std::cout << "  Molecule B Index : " << idxB << " (" << molB.filename << ")\n";
-        std::cout << "  Best Trio in B   : b1 = " << res.bestB1 << ", b2 = " << res.bestB2 << "\n";
-        std::cout << "  Bottleneck Dist  : " << std::fixed << std::setprecision(6) << res.bestBottleneck << "\n";
-        std::cout << "  Time Elapsed     : " << std::fixed << std::setprecision(3) << elapsedMs << " ms\n";
-        std::cout << "  Refine Iterations: " << res.refineIterationsUsed << "\n";
-        std::cout << "  Same Symbol Match: " << (opt.requireSameSymbol ? "Enabled" : "Disabled") << "\n";
-        std::cout << "-------------------------------------------------------\n";
-        std::cout << "  Rotation Matrix (3x3):\n";
-        for (int r = 0; r < 3; ++r)
-        {
-            std::cout << "    [ " << std::setw(10) << res.rotation[r * 3 + 0]
-                      << ", " << std::setw(10) << res.rotation[r * 3 + 1]
-                      << ", " << std::setw(10) << res.rotation[r * 3 + 2] << " ]\n";
-        }
-        std::cout << "  Translation Vector [tx, ty, tz]: [ "
-                  << res.translation[0] << ", " << res.translation[1] << ", " << res.translation[2] << " ]\n";
-        std::cout << "-------------------------------------------------------\n";
-        std::cout << "  Point-to-Point Matching (Cloud A -> Cloud B):\n";
-        std::cout << std::left << std::setw(12) << "Index A" << std::setw(12) << "Index B" << "\n";
-        std::cout << "-------------------------------------------------------\n";
-        for (size_t i = 0; i < res.matching.size(); ++i)
-        {
-            std::cout << std::left << std::setw(12) << i << std::setw(12) << res.matching[i] << "\n";
-        }
-        std::cout << "=======================================================\n\n";
     }
 
     bool visualizeIndex(size_t index) const
@@ -368,7 +387,6 @@ public:
         return true;
     }
 
-    // Removes visual rendering of a molecule by index
     bool unviewIndex(size_t index) const
     {
         if (index >= m_entries.size())
@@ -400,6 +418,7 @@ public:
     {
         return m_faissManager.searchKNNForAll(kStr, metricType, csvPath);
     }
+
     float computePairMetric(size_t idxA, size_t idxB, const std::string &metricType) const
     {
         return m_faissManager.computePairDistance(idxA, idxB, metricType);
@@ -430,7 +449,6 @@ public:
         std::cout << "=======================================================\n\n";
     }
 
-    // Trigger parallel computation of SRD and SRV across all loaded molecules
     void computeDescriptors()
     {
         m_faissManager.computeDescriptorsForAll(
@@ -439,7 +457,6 @@ public:
             { return m_entries[i].atoms; });
     }
 
-    // Flush/delete all descriptors and FAISS indices
     void flushDescriptors()
     {
         m_faissManager.clear();
@@ -459,31 +476,9 @@ public:
         std::cout << "=======================================================\n";
         std::cout << "  Database ID    : " << mol.id << "\n";
         std::cout << "  Filename       : " << mol.filename << "\n";
-        //    std::cout << "  Comment Line   : " << mol.commentLine << "\n";
         std::cout << "  Atom Count     : " << mol.numAtoms << "\n";
 
-        // Prints SRD and SRV if computed
         m_faissManager.printDescriptors(index);
-
-        std::cout << "-------------------------------------------------------\n";
-        std::cout << "  Atomic Coordinates:\n";
-
-        size_t printLimit = std::min(mol.numAtoms, (size_t)40);
-        for (size_t i = 0; i < printLimit; ++i)
-        {
-            const auto &a = mol.atoms[i];
-            std::cout << "    [" << std::setw(3) << i << "] "
-                      << std::setw(3) << a.symbol << " | X: "
-                      << std::setw(11) << std::fixed << std::setprecision(6) << a.x << ", Y: "
-                      << std::setw(11) << a.y << ", Z: "
-                      << std::setw(11) << a.z << " | Q: "
-                      << std::setw(8) << a.charge << "\n";
-        }
-        if (mol.numAtoms > printLimit)
-        {
-            std::cout << "    ... (showing first " << printLimit << " of " << mol.numAtoms << " atoms)\n";
-        }
-        std::cout << "=======================================================\n\n";
     }
 
     bool setMatchVisible(size_t a, size_t b, bool v)
@@ -526,6 +521,7 @@ public:
     }
 
     size_t size() const { return m_entries.size(); }
+    
     void clearAll()
     {
         MatchingViz::clearAll();
@@ -534,24 +530,23 @@ public:
     }
 
     void exploreClusters()
-{
-    if (m_lastBatchMatches.empty())
     {
-        std::cout << "[XyzStore] Error: No recent batch duplicate check found. Run 'dup_check all' first.\n";
-        return;
+        if (m_lastBatchMatches.empty())
+        {
+            std::cout << "[XyzStore] Error: No recent batch duplicate check found. Run 'dup_check all' first.\n";
+            return;
+        }
+
+        std::vector<std::string> filenames(m_entries.size());
+        std::vector<size_t> atomCounts(m_entries.size());
+        for (size_t i = 0; i < m_entries.size(); ++i)
+        {
+            filenames[i] = m_entries[i].filename;
+            atomCounts[i] = m_entries[i].numAtoms;
+        }
+
+        MolecularGraphViz::buildClusters(m_lastBatchMatches, atomCounts);
     }
-
-    std::vector<std::string> filenames(m_entries.size());
-    std::vector<size_t> atomCounts(m_entries.size());
-    for (size_t i = 0; i < m_entries.size(); ++i)
-    {
-        filenames[i] = m_entries[i].filename;
-        atomCounts[i] = m_entries[i].numAtoms;
-    }
-
-    MolecularGraphViz::buildClusters(m_lastBatchMatches, atomCounts);
-}
-
 
     void setGraphVisible(bool visible) const
     {
@@ -559,9 +554,72 @@ public:
     }
 
     void clearGraph() const
-{
-    MolecularGraphViz::clearGraph();
-}
+    {
+        MolecularGraphViz::clearGraph();
+    }
+
+    std::string getFilename(size_t index) const
+    {
+        if (index >= m_entries.size())
+            return "";
+        return m_entries[index].filename;
+    }
+
+    std::string getComment(size_t index) const
+    {
+        if (index >= m_entries.size())
+            return "";
+        return m_entries[index].commentLine;
+    }
+
+    size_t getAtomCount(size_t index) const
+    {
+        if (index >= m_entries.size())
+            return 0;
+        return m_entries[index].numAtoms;
+    }
+
+    std::string getRawContent(size_t index) const
+    {
+        if (index >= m_entries.size())
+            return "";
+        const auto &mol = m_entries[index];
+        std::ostringstream oss;
+        oss << mol.numAtoms << "\n"
+            << mol.commentLine << "\n";
+        for (const auto &a : mol.atoms)
+        {
+            oss << a.symbol << " " << a.x << " " << a.y << " " << a.z;
+            if (a.charge != 0.0)
+                oss << " " << a.charge;
+            oss << "\n";
+        }
+        return oss.str();
+    }
+
+    std::vector<float> getSDV(size_t index) const
+    {
+        const auto *desc = m_faissManager.descriptor(index);
+        if (!desc || !desc->computed)
+            return {};
+        return desc->sdv;
+    }
+
+    std::vector<float> getSRV(size_t index) const
+    {
+        const auto *desc = m_faissManager.descriptor(index);
+        if (!desc || !desc->computed)
+            return {};
+        return desc->srv;
+    }
+
+    std::vector<float> getPDD(size_t index) const
+    {
+        const auto *desc = m_faissManager.descriptor(index);
+        if (!desc || !desc->computed)
+            return {};
+        return desc->pdd;
+    }
 
 private:
     std::vector<MoleculeEntry> m_entries;
