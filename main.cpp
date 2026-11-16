@@ -91,25 +91,30 @@ int main(int argc, char *argv[])
     std::cout << "Initializing Polyscope GUI...\n";
     PolyscopeBridge::init();
 
-    MatchingViz::install();
-
     MolecularDatasetStore xyzStore;
     CommandDispatcher ui;
+
+    DatasetBrowserViz::s_windowVisible = false;
 
     // Register the ImGui window callback here
     PolyscopeBridge::s_extraUserCallback = [&]()
     {
-        // Toggle checkbox for the browser window in Polyscope UI
         ImGui::Checkbox("Dataset Browser", &DatasetBrowserViz::s_windowVisible);
 
-        // Existing cluster graph window
-        std::vector<std::string> filenames(xyzStore.size());
-        std::vector<size_t> atomCounts(xyzStore.size());
-        MolecularGraphViz::drawImGuiWindow(filenames, atomCounts);
+        // Only allocate if the cluster graph window is actually open
+        static std::vector<std::string> emptyFilenames;
+        static std::vector<size_t> emptyAtomCounts;
+        MolecularGraphViz::drawImGuiWindow(emptyFilenames, emptyAtomCounts);
 
-        // Render the dataset browser table window
-        DatasetBrowserViz::drawWindow(xyzStore);
+        if (DatasetBrowserViz::s_windowVisible)
+        {
+            DatasetBrowserViz::drawWindow(xyzStore);
+        }
     };
+
+    // Must come AFTER the assignment above: it wraps the existing callback
+    // and adds drawLines() plus the line checkbox/slider/color controls.
+    MatchingViz::install();
 
     // ==========================================
     // 1. DATASET MANAGEMENT & INSPECTION

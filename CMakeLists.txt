@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.17)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 project(ScientificDB CXX)
@@ -7,7 +7,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Optional MariaDB Integration
+# Optional Integrations (OFF by default)
+option(ENABLE_GPU "Enable CUDA/GPU support" OFF)
 option(ENABLE_MYSQL "Enable MariaDB database integration" OFF)
 set(MARIADB_DIR "$ENV{HOME}/Projects/CPPProj/MariaDB" CACHE PATH "Path to MariaDB source/build root")
 
@@ -50,36 +51,43 @@ endif()
 find_package(OpenMP REQUIRED)
 find_package(TBB REQUIRED)
 
-# Include paths for system-installed FAISS and CUDA headers
+# Base include and link paths (CPU)
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
     /usr/local/include
-    /usr/local/cuda/include
 )
 
-# Library paths for system FAISS and CUDA binaries
 link_directories(
     /usr/local/lib64
-    /usr/local/cuda/lib64
 )
 
 add_executable(ScientificDB main.cpp)
 
-# Link chemfiles, polyscope, readline, FAISS, OpenBLAS, CUDA runtimes, OpenMP, and TBB
+# Link base CPU dependencies
 target_link_libraries(ScientificDB PRIVATE 
     chemfiles 
     polyscope
     readline
     faiss
     openblas
-    cudart
-    cublas
     OpenMP::OpenMP_CXX
     TBB::tbb
 )
 
-# Configure MariaDB if enabled
-# Configure MariaDB if enabled
+# Configure CUDA/GPU if enabled
+if(ENABLE_GPU)
+    find_package(CUDAToolkit REQUIRED)
+    target_compile_definitions(ScientificDB PRIVATE USE_GPU=1)
+    target_link_libraries(ScientificDB PRIVATE 
+        CUDA::cudart
+        CUDA::cublas
+    )
+    message(STATUS "[ScientificDB] GPU/CUDA support ENABLED.")
+else()
+    target_compile_definitions(ScientificDB PRIVATE USE_GPU=0)
+    message(STATUS "[ScientificDB] GPU/CUDA support DISABLED (CPU-only mode).")
+endif()
+
 # Configure MariaDB if enabled
 if(ENABLE_MYSQL)
     # Locate libmariadb across the actual nested source-build output paths

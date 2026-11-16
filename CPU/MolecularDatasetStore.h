@@ -30,6 +30,18 @@ public:
     MolecularDatasetStore() = default;
     ~MolecularDatasetStore() { clearAll(); }
 
+    void ensureDescriptorsUpToDate()
+    {
+        if (!m_descriptorsDirty && m_faissManager.descriptorCount() == m_entries.size())
+            return;
+
+        m_faissManager.syncWithEntries(
+            m_entries.size(),
+            [this](size_t i) -> const std::vector<AtomRecord> &
+            { return m_entries[i].atoms; });
+        m_descriptorsDirty = false;
+    }
+
     bool addFile(const std::string &filepath)
     {
         std::ifstream file(filepath);
@@ -80,11 +92,11 @@ public:
 
         mol.numAtoms = mol.atoms.size();
         m_entries.push_back(std::move(mol));
+        m_descriptorsDirty = true;
         return true;
     }
 
-    // Parses a raw XYZ string content directly into a molecule entry in RAM
-    bool addStringContent(const std::string& filename, const std::string& content)
+    bool addStringContent(const std::string &filename, const std::string &content)
     {
         std::istringstream file(content);
         std::string line;
@@ -92,9 +104,12 @@ public:
             return false;
 
         int numAtoms = 0;
-        try {
+        try
+        {
             numAtoms = std::stoi(line);
-        } catch (...) {
+        }
+        catch (...)
+        {
             return false;
         }
 
@@ -116,7 +131,8 @@ public:
             AtomRecord atom;
             if (iss >> atom.symbol >> atom.x >> atom.y >> atom.z)
             {
-                if (!(iss >> atom.charge)) {
+                if (!(iss >> atom.charge))
+                {
                     atom.charge = 0.0;
                 }
                 mol.atoms.push_back(atom);
@@ -125,11 +141,12 @@ public:
 
         mol.numAtoms = mol.atoms.size();
         m_entries.push_back(std::move(mol));
+        m_descriptorsDirty = true;
         return true;
     }
 
-    // Allows direct insertion of programmatically generated molecules
-    size_t addSyntheticEntry(const std::string& filename, const std::string& comment, const std::vector<AtomRecord>& atoms) {
+    size_t addSyntheticEntry(const std::string &filename, const std::string &comment, const std::vector<AtomRecord> &atoms)
+    {
         MoleculeEntry mol;
         mol.id = m_nextId++;
         mol.filename = filename;
@@ -137,6 +154,7 @@ public:
         mol.atoms = atoms;
         mol.numAtoms = atoms.size();
         m_entries.push_back(std::move(mol));
+        m_descriptorsDirty = true;
         return m_entries.size();
     }
 
@@ -149,11 +167,14 @@ public:
             st = DupRunStats{};
             return {};
         }
+
+        ensureDescriptorsUpToDate();
+
         const auto &qMol = m_entries[queryIdx];
         const auto *qDesc = m_faissManager.descriptor(queryIdx);
         if (!qDesc || !qDesc->computed)
         {
-            std::cout << "[XyzStore] Error: Descriptors not computed. Run 'compute' first.\n";
+            std::cout << "[XyzStore] Error: Descriptors could not be computed.\n";
             st = DupRunStats{};
             return {};
         }
@@ -212,6 +233,8 @@ public:
             st = DupRunStats{};
             return {};
         }
+
+        ensureDescriptorsUpToDate();
 
         std::vector<DupMatch> matches = checker.runAll(
             m_faissManager,
@@ -309,8 +332,9 @@ public:
         return count;
     }
 
-    bool searchKNN(size_t index, const std::string &kStr, const std::string &metricType, const std::string &csvPath = "", bool restrictToLast = false) const
+    bool searchKNN(size_t index, const std::string &kStr, const std::string &metricType, const std::string &csvPath = "", bool restrictToLast = false)
     {
+        ensureDescriptorsUpToDate();
         return m_faissManager.searchKNN(index, kStr, metricType, csvPath, restrictToLast);
     }
 
@@ -358,10 +382,7 @@ public:
             opt.symbolsB = &symbolsB;
         }
 
-        auto tStart = std::chrono::high_resolution_clock::now();
         AlignmentResult res = CloudAlignmentEvaluator::alignAndEvaluate(cloudA, cloudB, opt);
-        auto tEnd = std::chrono::high_resolution_clock::now();
-        double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
 
         if (!res.success)
         {
@@ -407,6 +428,8 @@ public:
             MatchingViz::removeForMolecule(m_entries[index].id);
             size_t id = m_entries[index].id;
             m_entries.erase(m_entries.begin() + index);
+            m_faissManager.removeEntryAt(index);
+            m_descriptorsDirty = (m_faissManager.descriptorCount() != m_entries.size());
             std::cout << "[XyzStore] Removed molecule at index " << index << " (ID: " << id << ")\n";
             return true;
         }
@@ -414,13 +437,15 @@ public:
         return false;
     }
 
-    bool searchKNNForAll(const std::string &kStr, const std::string &metricType, const std::string &csvPath) const
+    bool searchKNNForAll(const std::string &kStr, const std::string &metricType, const std::string &csvPath)
     {
+        ensureDescriptorsUpToDate();
         return m_faissManager.searchKNNForAll(kStr, metricType, csvPath);
     }
 
-    float computePairMetric(size_t idxA, size_t idxB, const std::string &metricType) const
+    float computePairMetric(size_t idxA, size_t idxB, const std::string &metricType)
     {
+        ensureDescriptorsUpToDate();
         return m_faissManager.computePairDistance(idxA, idxB, metricType);
     }
 
@@ -455,11 +480,13 @@ public:
             m_entries.size(),
             [this](size_t i) -> const std::vector<AtomRecord> &
             { return m_entries[i].atoms; });
+        m_descriptorsDirty = false;
     }
 
     void flushDescriptors()
     {
         m_faissManager.clear();
+        m_descriptorsDirty = true;
     }
 
     void inspect(size_t index) const
@@ -521,12 +548,14 @@ public:
     }
 
     size_t size() const { return m_entries.size(); }
-    
+
     void clearAll()
     {
         MatchingViz::clearAll();
         m_entries.clear();
         m_faissManager.clear();
+        m_lastBatchMatches.clear();
+        m_descriptorsDirty = false;
     }
 
     void exploreClusters()
@@ -626,6 +655,7 @@ private:
     size_t m_nextId = 0;
     FaissIndexManager m_faissManager;
     std::vector<DupMatch> m_lastBatchMatches;
+    bool m_descriptorsDirty = false;
 
     void printProgressBar(size_t current, size_t total) const
     {
