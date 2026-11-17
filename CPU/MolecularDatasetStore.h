@@ -343,12 +343,12 @@ public:
         m_faissManager.printDistanceDistribution();
     }
 
-    void printPairAlignment(size_t idxA, size_t idxB, AlignmentOptions opt = AlignmentOptions()) const
+  bool printPairAlignmentWithStats(size_t idxA, size_t idxB, AlignmentOptions opt = AlignmentOptions())
     {
         if (idxA >= m_entries.size() || idxB >= m_entries.size())
         {
             std::cout << "[XyzStore] Error: Index out of range.\n";
-            return;
+            return false;
         }
 
         const auto &molA = m_entries[idxA];
@@ -357,7 +357,7 @@ public:
         if (molA.numAtoms != molB.numAtoms || molA.numAtoms == 0)
         {
             std::cout << "[XyzStore] Error: Molecules must have an equal and non-zero number of atoms for alignment.\n";
-            return;
+            return false;
         }
 
         std::vector<CloudAlignmentEvaluator::Point3F> cloudA(molA.numAtoms);
@@ -382,16 +382,40 @@ public:
             opt.symbolsB = &symbolsB;
         }
 
+        auto tStart = std::chrono::high_resolution_clock::now();
         AlignmentResult res = CloudAlignmentEvaluator::alignAndEvaluate(cloudA, cloudB, opt);
+        auto tEnd = std::chrono::high_resolution_clock::now();
+        double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
 
         if (!res.success)
         {
             std::cout << "[CloudAlignment] Alignment failed or exceeded vertex limit.\n";
-            return;
+            return false;
         }
 
         MatchingViz::store(molA.id, molB.id, molA.filename, molB.filename, res);
-        std::cout << "[Matching] Stored (hidden). Use 'show_match <a> <b>' to display it.\n";
+
+        std::cout << "\n=======================================================\n";
+        std::cout << "  PAIRWISE RIGID ALIGNMENT & MATCHING (aligner)\n";
+        std::cout << "=======================================================\n";
+        std::cout << "  Molecule A Index : " << idxA << " (" << molA.filename << ")\n";
+        std::cout << "  Molecule B Index : " << idxB << " (" << molB.filename << ")\n";
+        std::cout << "  Bottleneck Dist  : " << std::fixed << std::setprecision(6) << res.bestBottleneck << "\n";
+        std::cout << "  Time Elapsed     : " << std::fixed << std::setprecision(3) << elapsedMs << " ms\n";
+        std::cout << "  Matching Pairs   : " << res.matching.size() << " atoms matched\n";
+        std::cout << "-------------------------------------------------------\n";
+        
+        // Print matching in compressed array format: [0, 1, 2, 3, ...]
+        std::cout << "  Atom Mapping     : [";
+        for (size_t i = 0; i < res.matching.size(); ++i)
+        {
+            std::cout << res.matching[i] << (i + 1 < res.matching.size() ? ", " : "");
+        }
+        std::cout << "]\n";
+        
+        std::cout << "=======================================================\n";
+        std::cout << "  [Matching] Stored. Use 'show_match " << idxA << " " << idxB << "' to display it.\n\n";
+        return true;
     }
 
     bool visualizeIndex(size_t index) const
@@ -489,7 +513,52 @@ public:
         m_descriptorsDirty = true;
     }
 
-    void inspect(size_t index) const
+    AlignmentResult computePairAlignmentWithStats(size_t idxA, size_t idxB, AlignmentOptions opt = AlignmentOptions())
+    {
+        if (idxA >= m_entries.size() || idxB >= m_entries.size())
+        {
+            return AlignmentResult{};
+        }
+
+        const auto &molA = m_entries[idxA];
+        const auto &molB = m_entries[idxB];
+
+        if (molA.numAtoms != molB.numAtoms || molA.numAtoms == 0)
+        {
+            return AlignmentResult{};
+        }
+
+        std::vector<CloudAlignmentEvaluator::Point3F> cloudA(molA.numAtoms);
+        std::vector<std::string> symbolsA(molA.numAtoms);
+        for (size_t i = 0; i < molA.numAtoms; ++i)
+        {
+            cloudA[i] = {static_cast<float>(molA.atoms[i].x), static_cast<float>(molA.atoms[i].y), static_cast<float>(molA.atoms[i].z)};
+            symbolsA[i] = molA.atoms[i].symbol;
+        }
+
+        std::vector<CloudAlignmentEvaluator::Point3F> cloudB(molB.numAtoms);
+        std::vector<std::string> symbolsB(molB.numAtoms);
+        for (size_t i = 0; i < molB.numAtoms; ++i)
+        {
+            cloudB[i] = {static_cast<float>(molB.atoms[i].x), static_cast<float>(molB.atoms[i].y), static_cast<float>(molB.atoms[i].z)};
+            symbolsB[i] = molB.atoms[i].symbol;
+        }
+
+        if (opt.requireSameSymbol)
+        {
+            opt.symbolsA = &symbolsA;
+            opt.symbolsB = &symbolsB;
+        }
+
+        AlignmentResult res = CloudAlignmentEvaluator::alignAndEvaluate(cloudA, cloudB, opt);
+        if (res.success)
+        {
+            MatchingViz::store(molA.id, molB.id, molA.filename, molB.filename, res);
+        }
+        return res;
+    }
+
+   void inspect(size_t index) const
     {
         if (index >= m_entries.size())
         {
@@ -503,7 +572,31 @@ public:
         std::cout << "=======================================================\n";
         std::cout << "  Database ID    : " << mol.id << "\n";
         std::cout << "  Filename       : " << mol.filename << "\n";
+        std::cout << "  Comment        : " << mol.commentLine << "\n";
         std::cout << "  Atom Count     : " << mol.numAtoms << "\n";
+        std::cout << "-------------------------------------------------------\n";
+        std::cout << std::left << std::setw(6) << "No."
+                  << std::setw(10) << "Symbol"
+                  << std::setw(14) << "X"
+                  << std::setw(14) << "Y"
+                  << std::setw(14) << "Z" << "\n";
+        std::cout << "-------------------------------------------------------\n";
+
+        size_t printLimit = std::min(mol.atoms.size(), size_t(100)); // Print up to 100 atoms
+        for (size_t i = 0; i < printLimit; ++i)
+        {
+            const auto &atom = mol.atoms[i];
+            std::cout << std::left << std::setw(6) << i
+                      << std::setw(10) << atom.symbol
+                      << std::setw(14) << std::fixed << std::setprecision(4) << atom.x
+                      << std::setw(14) << atom.y
+                      << std::setw(14) << atom.z << "\n";
+        }
+        if (mol.atoms.size() > printLimit)
+        {
+            std::cout << "  ... (showing first " << printLimit << " of " << mol.atoms.size() << " atoms)\n";
+        }
+        std::cout << "=======================================================\n";
 
         m_faissManager.printDescriptors(index);
     }

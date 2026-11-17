@@ -141,7 +141,11 @@ public:
         { return factor * eps * (1.0f + p.relTol) + 1e-6f; };
         const int nt = st.threads;
 
-        // ---- Fused Stage 1 (SRV LInf) + Stage 2 (Composition + SDV LInf) via Sorted Bucket
+        std::cout << "[DupCheck] Starting single-molecule duplicate check for query index " << queryIdx 
+                  << " (Atoms: " << n << ", Database Group Size: " << st.groupSize << ")\n" << std::flush;
+
+        // ---- Fused Stage 1 (SRV LInf) + Stage 2 (Composition + SDV LInf)
+        std::cout << "  [Stage 1+2/4] Running Fused SRV + SDV Range Search (threads: " << nt << ")... " << std::flush;
         double t0 = omp_get_wtime();
         std::vector<SrvSdvCandidate> stage2Cands;
         fm.rangeSearchSrvSdvSingle(queryIdx, lim(p.srvFactor), lim(p.sdvFactor),
@@ -162,11 +166,12 @@ public:
         }
 
         st.afterSdv = stage2Cands.size();
-        // Split fused time proportionally or record in msSdv (msSrv reflects binary slice + SRV scan)
         st.msSdv = (omp_get_wtime() - t0) * 1e3;
+        std::cout << "Done! (" << std::fixed << std::setprecision(2) << st.msSdv << " ms) | Candidates surviving: " << st.afterSdv << "\n" << std::flush;
 
         if (n > MAXN)
         {
+            std::cout << "  [Warning] Molecule atom count (" << n << ") exceeds MAXN (" << MAXN << "). PDD/aligner skipped.\n" << std::flush;
             st.verified = false;
             st.msTotal = (omp_get_wtime() - tAll) * 1e3;
             return out;
@@ -188,6 +193,10 @@ public:
         {
             const float pddLim = lim(p.pddFactor);
             std::vector<char> keep(cands.size(), 0);
+            std::atomic<size_t> processed(0);
+            const size_t totalCands = cands.size();
+
+            std::cout << "  [Stage 3/4] Running PDD Bottleneck Evaluation (0 / " << totalCands << " completed, 0%)... " << std::flush;
 
             auto worker3 = [&](long long i)
             {
@@ -197,6 +206,15 @@ public:
                 {
                     cands[i].pdd = v;
                     keep[i] = 1;
+                }
+                size_t done = ++processed;
+                if (totalCands > 100 && (done % (totalCands / 20 + 1) == 0 || done == totalCands))
+                {
+                    #pragma omp critical
+                    {
+                        std::cout << "\r  [Stage 3/4] Running PDD Bottleneck Evaluation (" << done << " / " << totalCands 
+                                  << " completed, " << (done * 100 / totalCands) << "%)... " << std::flush;
+                    }
                 }
             };
 
@@ -215,6 +233,7 @@ public:
         }
         st.afterPdd = cands.size();
         st.msPdd = (omp_get_wtime() - t0) * 1e3;
+        std::cout << "\r  [Stage 3/4] PDD Bottleneck Evaluation Complete! (" << std::fixed << std::setprecision(2) << st.msPdd << " ms) | Survivors: " << st.afterPdd << " / " << st.batchPddCount << "               \n" << std::flush;
 
         // ---- Stage 4: Exact Aligner
         t0 = omp_get_wtime();
@@ -228,32 +247,46 @@ public:
 
             std::vector<DupMatch> slots(cands.size());
             std::vector<char> ok(cands.size(), 0);
+            std::atomic<size_t> processed(0);
+            const size_t totalCands = cands.size();
+
+            std::cout << "  [Stage 4/4] Running Exact 3D Kabsch & Aligner (0 / " << totalCands << " completed, 0%)... " << std::flush;
 
             auto worker4 = [&](long long i)
             {
                 const auto &cAtoms = getAtoms(cands[i].g);
                 AlignmentResult res = CloudAlignmentEvaluator::alignAndEvaluate(cloudQ, toCloud(cAtoms), opt);
-                if (!res.success || res.bestBottleneck > accept)
-                    return;
+                if (res.success && res.bestBottleneck <= accept)
+                {
+                    int mism = 0;
+                    for (size_t a = 0; a < res.matching.size() && a < qAtoms.size(); ++a)
+                        if (std::string(qAtoms[a].symbol) != std::string(cAtoms[res.matching[a]].symbol))
+                            ++mism;
+                    if (!p.rejectSpeciesMismatch || mism == 0)
+                    {
+                        DupMatch &m = slots[i];
+                        m.queryIdx = queryIdx;
+                        m.matchIdx = cands[i].g;
+                        m.numAtoms = n;
+                        m.srvLinf = cands[i].srv;
+                        m.sdvLinf = cands[i].sdv;
+                        m.pddBottleneck = cands[i].pdd;
+                        m.alignBottleneck = res.bestBottleneck;
+                        m.speciesMismatches = mism;
+                        m.align = std::move(res);
+                        ok[i] = 1;
+                    }
+                }
 
-                int mism = 0;
-                for (size_t a = 0; a < res.matching.size() && a < qAtoms.size(); ++a)
-                    if (std::string(qAtoms[a].symbol) != std::string(cAtoms[res.matching[a]].symbol))
-                        ++mism;
-                if (p.rejectSpeciesMismatch && mism > 0)
-                    return;
-
-                DupMatch &m = slots[i];
-                m.queryIdx = queryIdx;
-                m.matchIdx = cands[i].g;
-                m.numAtoms = n;
-                m.srvLinf = cands[i].srv;
-                m.sdvLinf = cands[i].sdv;
-                m.pddBottleneck = cands[i].pdd;
-                m.alignBottleneck = res.bestBottleneck;
-                m.speciesMismatches = mism;
-                m.align = std::move(res);
-                ok[i] = 1;
+                size_t done = ++processed;
+                if (totalCands > 20 && (done % (totalCands / 20 + 1) == 0 || done == totalCands))
+                {
+                    #pragma omp critical
+                    {
+                        std::cout << "\r  [Stage 4/4] Running Exact 3D Kabsch & Aligner (" << done << " / " << totalCands 
+                                  << " completed, " << (done * 100 / totalCands) << "%)... " << std::flush;
+                    }
+                }
             };
 
             if (p.parallel && cands.size() > 4 && nt > 1)
@@ -279,6 +312,8 @@ public:
         st.afterAlign = out.size();
         st.msAlign = (omp_get_wtime() - t0) * 1e3;
         st.msTotal = (omp_get_wtime() - tAll) * 1e3;
+        
+        std::cout << "\r  [Stage 4/4] Exact Aligner Complete! (" << std::fixed << std::setprecision(2) << st.msAlign << " ms) | Verified Duplicates Found: " << st.afterAlign << "               \n" << std::flush;
         return out;
     }
 
@@ -301,7 +336,11 @@ public:
         auto lim = [&](float factor)
         { return factor * eps * (1.0f + p.relTol) + 1e-6f; };
 
+        std::cout << "[DupCheck] Starting BATCH duplicate check across all " << totalMols 
+                  << " molecules (threads: " << nt << ")...\n" << std::flush;
+
         // ---- Fused Stage 1 + Stage 2 across all sorted buckets (upper-triangular j > i only)
+        std::cout << "  [Stage 1+2/4] Running All-Pairs Fused SRV + SDV Range Search... " << std::flush;
         double t0 = omp_get_wtime();
         size_t totalSrvSurvPairs = 0;
         std::vector<SrvSdvCandidate> stage2Pairs;
@@ -324,6 +363,7 @@ public:
         stTotal.batchSrvCount = totalMols;
         stTotal.batchSdvCount = totalSrvSurvPairs;
         stTotal.batchMsSdv = (omp_get_wtime() - t0) * 1e3;
+        std::cout << "Done! (" << std::fixed << std::setprecision(2) << stTotal.batchMsSdv << " ms) | Surviving Pairs: " << stage2Pairs.size() << "\n" << std::flush;
 
         // ---- Stage 3: PDD Bottleneck matching on surviving pairs
         t0 = omp_get_wtime();
@@ -336,23 +376,38 @@ public:
         std::vector<PairCand> pddCands(stage2Pairs.size());
         std::vector<char> keepPdd(stage2Pairs.size(), 0);
         const float pddLim = lim(p.pddFactor);
+        std::atomic<size_t> processedPdd(0);
+        const size_t totalPddPairs = stage2Pairs.size();
+
+        std::cout << "  [Stage 3/4] Running Batch PDD Bottleneck Evaluation (0 / " << totalPddPairs << " completed, 0%)... " << std::flush;
 
         auto workerPdd = [&](long long k)
         {
             const auto &c = stage2Pairs[k];
             const MolecularDescriptors *dA = fm.descriptor(c.idxA);
             const MolecularDescriptors *dB = fm.descriptor(c.idxB);
-            if (!dA || !dB || dA->numAtoms != dB->numAtoms)
-                return;
-            const size_t n = dA->numAtoms;
-            if (n > MAXN)
-                return;
-
-            float v = 0.0f;
-            if (pddCheck(dA->pdd, dB->pdd, n, pddLim, v))
+            if (dA && dB && dA->numAtoms == dB->numAtoms)
             {
-                pddCands[k] = {c.idxA, c.idxB, n, c.srvLinf, c.sdvLinf, v};
-                keepPdd[k] = 1;
+                const size_t n = dA->numAtoms;
+                if (n <= MAXN)
+                {
+                    float v = 0.0f;
+                    if (pddCheck(dA->pdd, dB->pdd, n, pddLim, v))
+                    {
+                        pddCands[k] = {c.idxA, c.idxB, n, c.srvLinf, c.sdvLinf, v};
+                        keepPdd[k] = 1;
+                    }
+                }
+            }
+
+            size_t done = ++processedPdd;
+            if (totalPddPairs > 50 && (done % (totalPddPairs / 20 + 1) == 0 || done == totalPddPairs))
+            {
+                #pragma omp critical
+                {
+                    std::cout << "\r  [Stage 3/4] Running Batch PDD Bottleneck Evaluation (" << done << " / " << totalPddPairs 
+                              << " completed, " << (done * 100 / totalPddPairs) << "%)... " << std::flush;
+                }
             }
         };
 
@@ -369,6 +424,7 @@ public:
         }
         compact(pddCands, keepPdd);
         stTotal.batchMsPdd = (omp_get_wtime() - t0) * 1e3;
+        std::cout << "\r  [Stage 3/4] Batch PDD Evaluation Complete! (" << std::fixed << std::setprecision(2) << stTotal.batchMsPdd << " ms) | PDD Survivors: " << pddCands.size() << " / " << totalPddPairs << "               \n" << std::flush;
 
         // ---- Stage 4: Exact 3D Kabsch + Bottleneck Alignment on PDD survivors
         t0 = omp_get_wtime();
@@ -384,6 +440,10 @@ public:
 
             std::vector<DupMatch> slots(pddCands.size());
             std::vector<char> okAlign(pddCands.size(), 0);
+            std::atomic<size_t> processedAlign(0);
+            const size_t totalAlignPairs = pddCands.size();
+
+            std::cout << "  [Stage 4/4] Running Batch Exact 3D Kabsch & Aligner (0 / " << totalAlignPairs << " completed, 0%)... " << std::flush;
 
             auto workerAlign = [&](long long k)
             {
@@ -392,27 +452,37 @@ public:
                 const auto &atomsB = getAtoms(c.idxB);
 
                 AlignmentResult res = CloudAlignmentEvaluator::alignAndEvaluate(toCloud(atomsA), toCloud(atomsB), opt);
-                if (!res.success || res.bestBottleneck > accept)
-                    return;
+                if (res.success && res.bestBottleneck <= accept)
+                {
+                    int mism = 0;
+                    for (size_t a = 0; a < res.matching.size() && a < atomsA.size(); ++a)
+                        if (std::string(atomsA[a].symbol) != std::string(atomsB[res.matching[a]].symbol))
+                            ++mism;
+                    if (!p.rejectSpeciesMismatch || mism == 0)
+                    {
+                        DupMatch &m = slots[k];
+                        m.queryIdx = c.idxA;
+                        m.matchIdx = c.idxB;
+                        m.numAtoms = c.numAtoms;
+                        m.srvLinf = c.srv;
+                        m.sdvLinf = c.sdv;
+                        m.pddBottleneck = c.pdd;
+                        m.alignBottleneck = res.bestBottleneck;
+                        m.speciesMismatches = mism;
+                        m.align = std::move(res);
+                        okAlign[k] = 1;
+                    }
+                }
 
-                int mism = 0;
-                for (size_t a = 0; a < res.matching.size() && a < atomsA.size(); ++a)
-                    if (std::string(atomsA[a].symbol) != std::string(atomsB[res.matching[a]].symbol))
-                        ++mism;
-                if (p.rejectSpeciesMismatch && mism > 0)
-                    return;
-
-                DupMatch &m = slots[k];
-                m.queryIdx = c.idxA;
-                m.matchIdx = c.idxB;
-                m.numAtoms = c.numAtoms;
-                m.srvLinf = c.srv;
-                m.sdvLinf = c.sdv;
-                m.pddBottleneck = c.pdd;
-                m.alignBottleneck = res.bestBottleneck;
-                m.speciesMismatches = mism;
-                m.align = std::move(res);
-                okAlign[k] = 1;
+                size_t done = ++processedAlign;
+                if (totalAlignPairs > 20 && (done % (totalAlignPairs / 20 + 1) == 0 || done == totalAlignPairs))
+                {
+                    #pragma omp critical
+                    {
+                        std::cout << "\r  [Stage 4/4] Running Batch Exact 3D Kabsch & Aligner (" << done << " / " << totalAlignPairs 
+                                  << " completed, " << (done * 100 / totalAlignPairs) << "%)... " << std::flush;
+                    }
+                }
             };
 
             if (p.parallel && pddCands.size() > 4 && nt > 1)
@@ -443,6 +513,8 @@ public:
 
         stTotal.afterAlign = allMatches.size();
         stTotal.msTotal = (omp_get_wtime() - tStart) * 1e3;
+
+        std::cout << "\r  [Stage 4/4] Batch Exact Aligner Complete! (" << std::fixed << std::setprecision(2) << stTotal.batchMsAlign << " ms) | Verified Duplicate Pairs Found: " << allMatches.size() << "               \n" << std::flush;
         return allMatches;
     }
 

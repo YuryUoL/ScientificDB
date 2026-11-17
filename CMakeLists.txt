@@ -30,6 +30,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(polyscope)
 
+# 3. Fetch cnpy (NumPy .npy/.npz reader/writer)
+FetchContent_Declare(
+    cnpy
+    GIT_REPOSITORY https://github.com/rogersce/cnpy.git
+    GIT_TAG master
+)
+FetchContent_MakeAvailable(cnpy)
+
 # Header Patches for modern GCC (kept safe if older headers are fetched)
 if(EXISTS ${polyscope_SOURCE_DIR}/include/polyscope/internal.h)
     file(READ ${polyscope_SOURCE_DIR}/include/polyscope/internal.h POLYSCOPE_INTERNAL_H)
@@ -63,10 +71,17 @@ link_directories(
 
 add_executable(ScientificDB main.cpp)
 
-# Link base CPU dependencies
+# Expose cnpy header path to the target
+target_include_directories(ScientificDB PRIVATE
+    ${cnpy_SOURCE_DIR}
+)
+
+# Link base CPU dependencies (including cnpy and zlib required for compression)
 target_link_libraries(ScientificDB PRIVATE 
     chemfiles 
     polyscope
+    cnpy
+    z
     readline
     faiss
     openblas

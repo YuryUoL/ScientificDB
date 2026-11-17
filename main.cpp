@@ -24,6 +24,8 @@
 
 #include "CPU/DatasetBrowserViz.h"
 
+#include "CPU/NpyReader.h"
+
 #if USE_MYSQL
 #include "Database/DatabaseConnection.h"
 #include "Database/MoleculeRepository.h"
@@ -212,6 +214,52 @@ int main(int argc, char *argv[])
         });
     ui.registerAlias("load_and_compute", "loadAndCompute");
     ui.registerAlias("loadCompute", "loadAndCompute");
+
+
+    // Register Command: loadNpy <xyz_folder> <labels_folder> [conformation_index]
+    ui.registerCommand(
+        "loadNpy", "<xyz_folder> <labels_folder> [conformation_index: 0=first, -1=all, N=specific]",
+        "Loads GEOM .npy dataset folders (XYZ coordinates & atomic labels) into host RAM.\n"
+        "  Conformation Index Options:\n"
+        "    0  : Load only the 0th (first) conformation for each molecule (default)\n"
+        "    -1 : Load ALL conformations for all molecules\n"
+        "    N  : Load only the specific N-th conformation\n"
+        "  Example:\n"
+        "    loadNpy /path/to/XYZ /path/to/Labels 0\n"
+        "    loadNpy /path/to/XYZ /path/to/Labels -1",
+        [&](std::istringstream &iss)
+        {
+            std::string xyzFolder, labelsFolder;
+            int confIdx = 0; // Default to 0th conformation
+
+            iss >> std::ws;
+            if (iss.peek() == '\'' || iss.peek() == '"') {
+                char q = iss.get();
+                std::getline(iss, xyzFolder, q);
+            } else {
+                iss >> xyzFolder;
+            }
+
+            iss >> std::ws;
+            if (iss.peek() == '\'' || iss.peek() == '"') {
+                char q = iss.get();
+                std::getline(iss, labelsFolder, q);
+            } else {
+                iss >> labelsFolder;
+            }
+
+            if (iss >> confIdx) {
+                // confIdx successfully captured
+            }
+
+            if (xyzFolder.empty() || labelsFolder.empty()) {
+                std::cout << "Usage: loadNpy <xyz_folder> <labels_folder> [conformation_index (default: 0, -1 for all)]\n";
+                return;
+            }
+
+            NpyReader::loadDataset(xyzStore, xyzFolder, labelsFolder, confIdx);
+        });
+    ui.registerAlias("load_npy", "loadNpy");
 
     // Register Command: ShowAll [limit]
     ui.registerCommand(
@@ -438,6 +486,7 @@ int main(int argc, char *argv[])
         });
     ui.registerAlias("knnAll", "knn_all");
 
+    // Register Command: pair_dist <index1> <index2> [metric: srv/sdv/pdd/aligner] [key=val ...]
     ui.registerCommand(
         "pair_dist", "<index1> <index2> [metric: srv/sdv/pdd/aligner] [key=val ...]",
         "Computes exact distance metric or full rigid alignment with bottleneck distance and point matching.\n"
@@ -458,7 +507,7 @@ int main(int argc, char *argv[])
                 if (!(iss >> metric))
                     metric = "pdd";
 
-                if (metric == "aligner")
+               if (metric == "aligner")
                 {
                     AlignmentOptions opt;
                     std::string token;
@@ -470,7 +519,7 @@ int main(int argc, char *argv[])
                             opt.set(token.substr(0, eq), token.substr(eq + 1));
                         }
                     }
-                    xyzStore.printPairAlignment(idx1, idx2, opt);
+                    xyzStore.printPairAlignmentWithStats(idx1, idx2, opt);
                 }
                 else
                 {
@@ -497,7 +546,6 @@ int main(int argc, char *argv[])
                 std::cout << "Usage: pair_dist <index1> <index2> [metric: srv/sdv/pdd/aligner] [key=val ...]\n";
             }
         });
-
     ui.registerAlias("pairDist", "pair_dist");
     ui.registerAlias("dist_pair", "pair_dist");
 

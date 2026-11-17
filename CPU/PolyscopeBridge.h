@@ -103,6 +103,66 @@ namespace PolyscopeBridge {
         polyscope::frameTick();
     }
 
+    inline glm::vec3 getAtomColor(const std::string& symbol) {
+        // --- Period 1 ---
+        if (symbol == "H")  return {0.85f, 0.95f, 1.0f}; // White / Light Blue
+        if (symbol == "He") return {0.85f, 1.00f, 1.00f}; // Cyan
+
+        // --- Period 2 ---
+        if (symbol == "Li") return {0.80f, 0.50f, 1.00f}; // Violet
+        if (symbol == "Be") return {0.75f, 1.00f, 0.00f}; // Dark Green
+        if (symbol == "B")  return {1.00f, 0.70f, 0.70f}; // Pink
+        if (symbol == "C")  return {0.18f, 0.18f, 0.18f}; // Dark Gray / Black
+        if (symbol == "N")  return {0.15f, 0.40f, 0.90f}; // Blue
+        if (symbol == "O")  return {0.90f, 0.12f, 0.12f}; // Red
+        if (symbol == "F")  return {0.12f, 0.85f, 0.25f}; // Green
+        if (symbol == "Ne") return {0.70f, 0.89f, 0.96f}; // Cyan-Blue
+
+        // --- Period 3 ---
+        if (symbol == "Na") return {0.67f, 0.36f, 0.95f}; // Purple
+        if (symbol == "Mg") return {0.54f, 1.00f, 0.00f}; // Green
+        if (symbol == "Al") return {0.75f, 0.65f, 0.65f}; // Gray
+        if (symbol == "Si") return {0.90f, 0.80f, 0.60f}; // Sand / Gold-Gray
+        if (symbol == "P")  return {1.00f, 0.50f, 0.00f}; // Orange
+        if (symbol == "S")  return {0.85f, 0.85f, 0.15f}; // Yellow
+        if (symbol == "Cl") return {0.12f, 0.85f, 0.25f}; // Green
+        if (symbol == "Ar") return {0.50f, 0.82f, 0.89f}; // Cyan-Blue
+
+        // --- Period 4 ---
+        if (symbol == "K")  return {0.55f, 0.25f, 0.85f}; // Violet
+        if (symbol == "Ca") return {0.24f, 1.00f, 0.00f}; // Green
+        if (symbol == "Sc") return {0.90f, 0.90f, 0.90f}; // Silver Gray
+        if (symbol == "Ti") return {0.75f, 0.75f, 0.75f}; // Gray
+        if (symbol == "V")  return {0.65f, 0.65f, 0.68f}; // Blue-Gray
+        if (symbol == "Cr") return {0.54f, 0.60f, 0.78f}; // Blue-Gray
+        if (symbol == "Mn") return {0.62f, 0.40f, 0.55f}; // Dark Purple
+        if (symbol == "Fe") return {0.88f, 0.40f, 0.20f}; // Orange-Brown
+        if (symbol == "Co") return {0.27f, 0.55f, 0.82f}; // Blue
+        if (symbol == "Ni") return {0.31f, 0.82f, 0.31f}; // Green
+        if (symbol == "Cu") return {0.78f, 0.50f, 0.20f}; // Copper
+        if (symbol == "Zn") return {0.49f, 0.50f, 0.69f}; // Slate Blue
+        if (symbol == "Ga") return {0.76f, 0.56f, 0.56f}; // Gray-Pink
+        if (symbol == "Ge") return {0.40f, 0.56f, 0.56f}; // Dark Gray-Cyan
+        if (symbol == "As") return {0.74f, 0.50f, 0.89f}; // Purple
+        if (symbol == "Se") return {1.00f, 0.63f, 0.00f}; // Orange
+        if (symbol == "Br") return {0.60f, 0.10f, 0.10f}; // Dark Red / Brown
+        if (symbol == "Kr") return {0.36f, 0.72f, 0.82f}; // Cyan-Blue
+
+        // --- Period 5 & Heavier Halogens/Common Metals ---
+        if (symbol == "Ag") return {0.75f, 0.75f, 0.75f}; // Silver
+        if (symbol == "Cd") return {1.00f, 0.85f, 0.56f}; // Light Yellow
+        if (symbol == "Sn") return {0.40f, 0.50f, 0.50f}; // Gray
+        if (symbol == "Sb") return {0.62f, 0.38f, 0.71f}; // Purple
+        if (symbol == "Te") return {0.83f, 0.48f, 0.00f}; // Orange
+        if (symbol == "I")  return {0.45f, 0.10f, 0.70f}; // Dark Purple
+        if (symbol == "Xe") return {0.26f, 0.62f, 0.69f}; // Cyan-Blue
+        if (symbol == "Pt") return {0.80f, 0.82f, 0.89f}; // Platinum Gray
+        if (symbol == "Au") return {1.00f, 0.82f, 0.14f}; // Gold
+
+        // Fallback for any other exotic elements
+        return {0.75f, 0.75f, 0.75f}; 
+    }
+
     inline void visualizeMolecule(size_t id, const std::string& name, const std::vector<AtomRecord>& atoms) {
         if (atoms.empty()) return;
 
@@ -127,19 +187,7 @@ namespace PolyscopeBridge {
             glm::vec3 shiftedPos = glm::vec3(atom.x, atom.y, atom.z) - center;
             positions.push_back(shiftedPos);
 
-            glm::vec3 color(0.5f, 0.5f, 0.5f); // Default gray
-            if (atom.symbol == "C") {
-                color = glm::vec3(0.18f, 0.18f, 0.18f);
-            } else if (atom.symbol == "H") {
-                color = glm::vec3(0.85f, 0.95f, 1.0f);
-            } else if (atom.symbol == "O") {
-                color = glm::vec3(0.9f, 0.12f, 0.12f);
-            } else if (atom.symbol == "N") {
-                color = glm::vec3(0.15f, 0.4f, 0.9f);
-            } else if (atom.symbol == "F" || atom.symbol == "Cl") {
-                color = glm::vec3(0.12f, 0.85f, 0.25f);
-            }
-            colors.push_back(color);
+            colors.push_back(getAtomColor(atom.symbol));
 
             // Label = symbol + index, e.g. "C13"
             labelData.labels.push_back(atom.symbol + std::to_string(i + s_labelIndexBase));

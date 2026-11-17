@@ -768,7 +768,7 @@ public:
         }
     }
 
-    float computePairDistance(size_t idxA, size_t idxB, const std::string &metricType) const
+   float computePairDistance(size_t idxA, size_t idxB, const std::string &metricType) const
     {
         if (idxA >= m_descriptors.size() || idxB >= m_descriptors.size() ||
             !m_descriptors[idxA].computed || !m_descriptors[idxB].computed)
@@ -788,25 +788,25 @@ public:
 
         if (metricType == "srv")
         {
-            float sumSq = 0.0f;
+            float maxDiff = 0.0f;
             size_t n = std::min(descA.srv.size(), descB.srv.size());
             for (size_t i = 0; i < n; ++i)
             {
-                float diff = descA.srv[i] - descB.srv[i];
-                sumSq += diff * diff;
+                float diff = std::fabs(descA.srv[i] - descB.srv[i]);
+                if (diff > maxDiff) maxDiff = diff;
             }
-            return sumSq;
+            return maxDiff;
         }
         else if (metricType == "sdv")
         {
-            float sumSq = 0.0f;
+            float maxDiff = 0.0f;
             size_t n = std::min(descA.sdv.size(), descB.sdv.size());
             for (size_t i = 0; i < n; ++i)
             {
-                float diff = descA.sdv[i] - descB.sdv[i];
-                sumSq += diff * diff;
+                float diff = std::fabs(descA.sdv[i] - descB.sdv[i]);
+                if (diff > maxDiff) maxDiff = diff;
             }
-            return sumSq;
+            return maxDiff;
         }
         else if (metricType == "pdd" || metricType == "bottleneck")
         {
@@ -824,7 +824,6 @@ public:
         std::cout << "[FaissManager] Unknown metric type: " << metricType << "\n";
         return -1.0f;
     }
-
     bool searchKNNForAll(const std::string &kStr, const std::string &metricType, const std::string &csvOutputPath) const
     {
         if (m_descriptors.empty())
