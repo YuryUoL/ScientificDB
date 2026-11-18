@@ -163,7 +163,7 @@ namespace PolyscopeBridge {
         return {0.75f, 0.75f, 0.75f}; 
     }
 
-    inline void visualizeMolecule(size_t id, const std::string& name, const std::vector<AtomRecord>& atoms) {
+    inline void visualizeMolecule(size_t id, const std::string& name, const std::vector<AtomRecord>& atoms, bool autoCenter = true) {
         if (atoms.empty()) return;
 
         std::vector<glm::vec3> positions;
@@ -174,14 +174,16 @@ namespace PolyscopeBridge {
         labelData.labels.reserve(atoms.size());
         labelData.isHydrogen.reserve(atoms.size());
 
-        // 1. Geometric center
+        // 1. Geometric center (only calculated if autoCenter is true)
         glm::vec3 center(0.0f);
-        for (const auto& atom : atoms) {
-            center += glm::vec3(atom.x, atom.y, atom.z);
+        if (autoCenter) {
+            for (const auto& atom : atoms) {
+                center += glm::vec3(atom.x, atom.y, atom.z);
+            }
+            center /= static_cast<float>(atoms.size());
         }
-        center /= static_cast<float>(atoms.size());
 
-        // 2. Positions centered at (0,0,0) so the gizmo pivots around the molecule center
+        // 2. Positions centered at (0,0,0) based on center mode
         for (size_t i = 0; i < atoms.size(); ++i) {
             const auto& atom = atoms[i];
             glm::vec3 shiftedPos = glm::vec3(atom.x, atom.y, atom.z) - center;
@@ -204,7 +206,7 @@ namespace PolyscopeBridge {
         psCloud->setPointRadius(0.08f, true);
         psCloud->setTransformGizmoEnabled(s_gizmosEnabled);
 
-        // 3. Move the cloud back to its original world position
+        // 3. Move the cloud back to its original world position (skipped if autoCenter is false)
         glm::mat4 initialTransform = glm::translate(glm::mat4(1.0f), center);
         psCloud->setTransform(initialTransform);
 

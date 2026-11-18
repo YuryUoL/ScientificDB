@@ -12,7 +12,7 @@
 #include <glm/glm.hpp>
 
 #include "PolyscopeBridge.h"
-#include "CloudAligmentEvaluator.h"
+#include "CPU/Aligners/CloudAlignmentEvaluator.h"
 
 #include <imgui.h>
 #include <polyscope/view.h>

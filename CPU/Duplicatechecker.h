@@ -12,8 +12,8 @@
 #include <atomic>
 #include <omp.h>
 #include "FaissIndexManager.h"
-#include "CloudAligmentEvaluator.h"
-#include "BottleneckEvaluator.h"
+#include "Aligners/CloudAlignmentEvaluator.h"
+#include "Aligners/BottleneckEvaluator.h"
 
 struct DupCheckParams
 {

@@ -9,7 +9,7 @@
 #include <iomanip>
 #include <imgui.h>
 #include "PolyscopeBridge.h"
-#include "Duplicatechecker.h"
+#include "CPU/Duplicatechecker.h"
 
 class MolecularGraphViz
 {

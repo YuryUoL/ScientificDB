@@ -69,7 +69,17 @@ link_directories(
     /usr/local/lib64
 )
 
-add_executable(ScientificDB main.cpp)
+# Automatically gather main.cpp and all source files recursively across subdirectories
+file(GLOB_RECURSE SOURCES 
+    "main.cpp"
+    "*.cpp"
+    "CPU/*.cpp"
+    "CPU/**/*.cpp"
+    "Database/*.cpp"
+    "Database/**/*.cpp"
+)
+
+add_executable(ScientificDB ${SOURCES})
 
 # Expose cnpy header path to the target
 target_include_directories(ScientificDB PRIVATE

@@ -6,7 +6,7 @@
 #include <iostream>
 #include <fstream>
 #include <cnpy.h>
-#include "MolecularDatasetStore.h"
+#include "CPU/MolecularDatasetStore.h"
 
 class NpyReader
 {

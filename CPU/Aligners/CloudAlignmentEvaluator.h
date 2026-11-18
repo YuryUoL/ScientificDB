@@ -378,14 +378,17 @@ public:
 
             const float lb = std::max(rowMinMax, lbSearchSq);
             const float v = BottleneckEvaluator::computeFromCostMatrix(cost, n, std::min(lb, t), t);
-            if (v < bestSq) {
+            if (v < bestSq)
+            {
                 bestSq = v;
                 bestC = c;
                 found = true;
-                if (!opt.exact && opt.acceptDistance == 0.0f) {
+                if (!opt.exact && opt.acceptDistance == 0.0f)
+                {
                     break; // Early exit on first valid match when exact=0
                 }
-                if (bestSq <= stopSq) break;
+                if (bestSq <= stopSq)
+                    break;
             }
         }
 
@@ -474,7 +477,7 @@ public:
         return result;
     }
 
-private:
+    // private:
     static void matMul3(const float X[9], const float Y[9], float Z[9])
     {
         for (int r = 0; r < 3; ++r)

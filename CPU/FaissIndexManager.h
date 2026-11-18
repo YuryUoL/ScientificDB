@@ -15,12 +15,12 @@
 #include <limits>
 #include <omp.h>
 #include <faiss/IndexFlat.h>
-#include "PolyscopeBridge.h"
+#include "Visualization/PolyscopeBridge.h"
 #include <fstream>
 #include <atomic>
 #include <chrono>
 #include <execution>
-#include "BottleneckEvaluator.h"
+#include "Aligners/BottleneckEvaluator.h"
 
 struct KNNResult
 {

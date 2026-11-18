@@ -8,12 +8,15 @@
 #include <filesystem>
 #include <algorithm>
 #include <iomanip>
-#include "PolyscopeBridge.h"
+#include "Visualization/PolyscopeBridge.h"
 #include "FaissIndexManager.h"
-#include "CloudAligmentEvaluator.h"
-#include "Matchingvisualizer.h"
+#include "Aligners/CloudAlignmentEvaluator.h"
+#include "Aligners/AtomicCloudAlignmentEvaluator.h"
+#include "Visualization/Matchingvisualizer.h"
+#include "Visualization/AtomicMatchingViz.h"
 #include "Duplicatechecker.h"
-#include "MolecularGraphViz.h"
+#include "Visualization/MolecularGraphViz.h"
+#include <oneapi/tbb/parallel_sort.h>
 
 struct MoleculeEntry
 {
@@ -24,11 +27,448 @@ struct MoleculeEntry
     size_t numAtoms = 0;
 };
 
+struct AtomicCloudEntry
+{
+    size_t id;
+    size_t parentMoleculeIdx;
+    size_t atomIndex;
+    std::string name;   // e.g., "water.xyz_H0"
+    std::string symbol; // e.g., "H"
+    std::vector<AtomRecord> atoms;
+    size_t numAtoms = 0;
+
+    // --- New Atomic Descriptors ---
+    std::vector<float> sortedDistances;    // N-1 distances sorted ascending (excluding center atom at 0)
+    std::vector<size_t> sortedAtomIndices; // Original atom indices sorted by distance to centroid
+    bool descriptorsComputed = false;
+};
+
 class MolecularDatasetStore
 {
 public:
     MolecularDatasetStore() = default;
     ~MolecularDatasetStore() { clearAll(); }
+
+bool computeAtomicAlignerDistance(size_t idxA, size_t idxB, size_t N, const AlignmentOptions& opt = AlignmentOptions())
+    {
+        if (idxA >= m_atomicEntries.size() || idxB >= m_atomicEntries.size())
+        {
+            std::cout << "[AtomicStore] Error: Index out of range.\n";
+            return false;
+        }
+
+        const auto &acA = m_atomicEntries[idxA];
+        const auto &acB = m_atomicEntries[idxB];
+
+        if (!acA.descriptorsComputed || !acB.descriptorsComputed)
+        {
+            std::cout << "[AtomicStore] Error: Descriptors not computed. Run 'ComputeAtomicDescriptors' first.\n";
+            return false;
+        }
+
+        // Cloud A subset: Take N closest atoms (EXCLUDING the centroid at index 0)
+        // sortedAtomIndices already excludes the center atom and is sorted by distance ascending.
+        std::vector<size_t> idxA_subset;
+        size_t limitA = (N > 0) ? std::min(N, acA.sortedAtomIndices.size()) : acA.sortedAtomIndices.size();
+        for (size_t i = 0; i < limitA; ++i)
+        {
+            idxA_subset.push_back(acA.sortedAtomIndices[i]);
+        }
+
+        if (idxA_subset.empty())
+        {
+            std::cout << "[AtomicStore] Error: Cloud A subset is empty (N=0 or no neighbor atoms).\n";
+            return false;
+        }
+
+        // Cloud B subset: Take all atoms EXCEPT the centroid (skip index 0)
+        std::vector<size_t> idxB_subset;
+        for (size_t j = 0; j < acB.atoms.size(); ++j)
+        {
+            if (j == 0) continue; // Exclude centroid
+            idxB_subset.push_back(j);
+        }
+
+        if (idxB_subset.size() < idxA_subset.size())
+        {
+            std::cout << "[AtomicStore] Error: Cloud B subset size (" << idxB_subset.size() 
+                      << ") is smaller than Cloud A subset size (" << idxA_subset.size() << ").\n";
+            return false;
+        }
+
+        // Convert atoms to Point3F
+        std::vector<CloudAlignmentEvaluator::Point3F> cloudA(acA.atoms.size());
+        std::vector<std::string> symbolsA(acA.atoms.size());
+        for (size_t i = 0; i < acA.atoms.size(); ++i)
+        {
+            cloudA[i] = {static_cast<float>(acA.atoms[i].x), static_cast<float>(acA.atoms[i].y), static_cast<float>(acA.atoms[i].z)};
+            symbolsA[i] = acA.atoms[i].symbol;
+        }
+
+        std::vector<CloudAlignmentEvaluator::Point3F> cloudB(acB.atoms.size());
+        std::vector<std::string> symbolsB(acB.atoms.size());
+        for (size_t i = 0; i < acB.atoms.size(); ++i)
+        {
+            cloudB[i] = {static_cast<float>(acB.atoms[i].x), static_cast<float>(acB.atoms[i].y), static_cast<float>(acB.atoms[i].z)};
+            symbolsB[i] = acB.atoms[i].symbol;
+        }
+
+        AlignmentOptions localOpt = opt;
+        if (localOpt.requireSameSymbol)
+        {
+            localOpt.symbolsA = &symbolsA;
+            localOpt.symbolsB = &symbolsB;
+        }
+
+        auto tStart = std::chrono::high_resolution_clock::now();
+        SubsetAlignmentResult res = AtomicCloudAlignmentEvaluator::alignSubsetAndEvaluate(
+            cloudA, idxA_subset, cloudB, idxB_subset, localOpt);
+        auto tEnd = std::chrono::high_resolution_clock::now();
+        double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+
+        if (!res.success)
+        {
+            std::cout << "[AtomicAligner] Alignment failed or constraints not met.\n";
+            return false;
+        }
+
+        AtomicMatchingViz::store(idxA, idxB, acA.name, acB.name, res, idxA_subset, idxB_subset);
+
+        std::cout << "\n=======================================================\n";
+        std::cout << "  ATOMIC CLOUD ALIGNMENT & MATCHING (aligner - NO CENTROIDS)\n";
+        std::cout << "=======================================================\n";
+        std::cout << "  Atomic Cloud A   : " << idxA << " (" << acA.name << ")\n";
+        std::cout << "  Atomic Cloud B   : " << idxB << " (" << acB.name << ")\n";
+        std::cout << "  Subset Size A    : " << idxA_subset.size() << " neighbor atoms (Centroid excluded)\n";
+        std::cout << "  Subset Size B    : " << idxB_subset.size() << " neighbor atoms (Centroid excluded)\n";
+        std::cout << "  Bottleneck Dist  : " << std::fixed << std::setprecision(6) << res.bestBottleneck << "\n";
+        std::cout << "  Time Elapsed     : " << std::fixed << std::setprecision(3) << elapsedMs << " ms\n";
+        std::cout << "-------------------------------------------------------\n";
+        std::cout << "  Atom Mapping     : [";
+        for (size_t i = 0; i < res.matching.size(); ++i)
+        {
+            std::cout << res.matching[i] << (i + 1 < res.matching.size() ? ", " : "");
+        }
+        std::cout << "]\n";
+        std::cout << "=======================================================\n";
+        std::cout << "  [AtomicMatching] Stored. Use 'apply_atomic_align " << idxA << " " << idxB << "' to rotate A into B.\n\n";
+        return true;
+    }
+
+    // --- Compute Atomic Descriptors (SRV-analog & Sorted Index Array) ---
+    void computeAtomicDescriptors()
+    {
+        if (m_atomicEntries.empty())
+        {
+            std::cout << "[AtomicStore] Error: No atomic clouds generated. Run 'expand_atoms' first.\n";
+            return;
+        }
+
+        size_t totalClouds = m_atomicEntries.size();
+        std::cout << "[AtomicStore] Computing atomic descriptors for " << totalClouds << " atomic clouds in parallel...\n";
+        auto tStart = std::chrono::high_resolution_clock::now();
+
+        std::atomic<size_t> completedClouds{0};
+
+#pragma omp parallel for schedule(dynamic, 64)
+        for (long long idx = 0; idx < static_cast<long long>(totalClouds); ++idx)
+        {
+            auto &ac = m_atomicEntries[idx];
+
+            struct AtomDistPair
+            {
+                size_t originalIdx;
+                float dist;
+            };
+            std::vector<AtomDistPair> pairs;
+            pairs.reserve(ac.atoms.size() > 0 ? ac.atoms.size() - 1 : 0);
+
+            for (size_t j = 0; j < ac.atoms.size(); ++j)
+            {
+                float x = static_cast<float>(ac.atoms[j].x);
+                float y = static_cast<float>(ac.atoms[j].y);
+                float z = static_cast<float>(ac.atoms[j].z);
+                float dist = std::sqrt(x * x + y * y + z * z);
+
+                // Avoid 0 distance (skip the center atom sitting at the origin)
+                if (dist < 1e-6f)
+                {
+                    continue;
+                }
+                pairs.push_back({j, dist});
+            }
+
+            // Sort by distance ascending
+            std::sort(pairs.begin(), pairs.end(), [](const auto &a, const auto &b)
+                      { return a.dist < b.dist; });
+
+            ac.sortedDistances.clear();
+            ac.sortedAtomIndices.clear();
+            ac.sortedDistances.reserve(pairs.size());
+            ac.sortedAtomIndices.reserve(pairs.size());
+
+            for (const auto &p : pairs)
+            {
+                ac.sortedDistances.push_back(p.dist);
+                ac.sortedAtomIndices.push_back(p.originalIdx);
+            }
+            ac.descriptorsComputed = true;
+
+            size_t done = ++completedClouds;
+            if (done % 500 == 0 || done == totalClouds)
+            {
+#pragma omp critical
+                {
+                    printProgressBar(done, totalClouds);
+                }
+            }
+        }
+
+        auto tEnd = std::chrono::high_resolution_clock::now();
+        double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+        std::cout << "\n[AtomicStore] Successfully computed atomic descriptors in "
+                  << std::fixed << std::setprecision(2) << elapsedMs << " ms.\n";
+    }
+
+    // --- Compute L_inf distance between two atomic clouds with parameter N ---
+    float computeAtomicPairDistance(size_t idxA, size_t idxB, const std::string &metric, size_t N = 0) const
+    {
+        if (idxA >= m_atomicEntries.size() || idxB >= m_atomicEntries.size())
+        {
+            std::cout << "[AtomicStore] Error: Atomic cloud index out of range.\n";
+            return -1.0f;
+        }
+
+        const auto &acA = m_atomicEntries[idxA];
+        const auto &acB = m_atomicEntries[idxB];
+
+        if (!acA.descriptorsComputed || !acB.descriptorsComputed)
+        {
+            std::cout << "[AtomicStore] Error: Atomic descriptors not computed. Run 'ComputeAtomicDescriptors' first.\n";
+            return -1.0f;
+        }
+
+        if (metric == "aligner")
+        {
+            std::cout << "[AtomicStore] Aligner metric for atomic clouds is not yet supported.\n";
+            return -1.0f;
+        }
+
+        if (metric == "srv" || metric == "default")
+        {
+            size_t lenA = acA.sortedDistances.size();
+            size_t lenB = acB.sortedDistances.size();
+            size_t maxAvailable = std::min(lenA, lenB);
+
+            // If N is specified, cap it by the max available extent of them
+            size_t limit = (N > 0) ? std::min(N, maxAvailable) : maxAvailable;
+
+            if (limit == 0)
+            {
+                std::cout << "[AtomicStore] Warning: Comparison length is 0.\n";
+                return 0.0f;
+            }
+
+            float maxDiff = 0.0f;
+            for (size_t i = 0; i < limit; ++i)
+            {
+                float diff = std::fabs(acA.sortedDistances[i] - acB.sortedDistances[i]);
+                if (diff > maxDiff)
+                {
+                    maxDiff = diff;
+                }
+            }
+            return maxDiff;
+        }
+
+        std::cout << "[AtomicStore] Unknown metric: " << metric << "\n";
+        return -1.0f;
+    }
+
+    // --- Atomic Neighborhood Cloud Expansion & Management ---
+   void generateAllAtomicClouds()
+    {
+        m_atomicEntries.clear();
+        size_t totalMols = m_entries.size();
+        if (totalMols == 0)
+        {
+            std::cout << "[AtomicStore] No molecules loaded to expand.\n";
+            return;
+        }
+
+        std::cout << "[AtomicStore] Expanding " << totalMols << " molecules into atomic neighborhoods in parallel...\n";
+        auto tStart = std::chrono::high_resolution_clock::now();
+
+        // Temporary thread-local storage containers to prevent race conditions during parallel push_back
+        int maxThreads = omp_get_max_threads();
+        std::vector<std::vector<AtomicCloudEntry>> threadPoolEntries(maxThreads);
+        std::atomic<size_t> completedMols{0};
+
+#pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            size_t localNextId = tid * 10000000; // Offset thread IDs to avoid collision
+
+#pragma omp for schedule(dynamic, 64)
+            for (size_t molIdx = 0; molIdx < totalMols; ++molIdx)
+            {
+                const auto &mol = m_entries[molIdx];
+                for (size_t i = 0; i < mol.atoms.size(); ++i)
+                {
+                    const auto &centerAtom = mol.atoms[i];
+
+                    AtomicCloudEntry atomicCloud;
+                    atomicCloud.id = localNextId++;
+                    atomicCloud.parentMoleculeIdx = molIdx;
+                    atomicCloud.atomIndex = i;
+                    atomicCloud.symbol = centerAtom.symbol;
+                    atomicCloud.name = mol.filename + "_" + centerAtom.symbol + std::to_string(i);
+
+                    atomicCloud.atoms.reserve(mol.atoms.size());
+                    for (size_t j = 0; j < mol.atoms.size(); ++j)
+                    {
+                        AtomRecord shifted = mol.atoms[j];
+                        shifted.x -= centerAtom.x;
+                        shifted.y -= centerAtom.y;
+                        shifted.z -= centerAtom.z;
+                        atomicCloud.atoms.push_back(shifted);
+                    }
+                    atomicCloud.numAtoms = atomicCloud.atoms.size();
+                    threadPoolEntries[tid].push_back(std::move(atomicCloud));
+                }
+
+                size_t done = ++completedMols;
+                if (done % 50 == 0 || done == totalMols)
+                {
+#pragma omp critical
+                    {
+                        printProgressBar(done, totalMols);
+                    }
+                }
+            }
+        }
+
+   // Merge thread-local results back into m_atomicEntries sequentially
+        for (int tid = 0; tid < maxThreads; ++tid)
+        {
+            for (auto &ac : threadPoolEntries[tid])
+            {
+                m_atomicEntries.push_back(std::move(ac));
+            }
+        }
+
+        // Parallel sort using Intel TBB (preserves file order and atom index order)
+        tbb::parallel_sort(m_atomicEntries.begin(), m_atomicEntries.end(), [](const auto &a, const auto &b) {
+            if (a.parentMoleculeIdx != b.parentMoleculeIdx)
+                return a.parentMoleculeIdx < b.parentMoleculeIdx;
+            return a.atomIndex < b.atomIndex;
+        });
+
+        // Reassign clean contiguous IDs after sorting
+        for (size_t i = 0; i < m_atomicEntries.size(); ++i)
+        {
+            m_atomicEntries[i].id = i;
+        }
+        m_nextAtomicId = m_atomicEntries.size();
+
+        auto tEnd = std::chrono::high_resolution_clock::now();
+        double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+        std::cout << "\n[AtomicStore] Successfully generated and sorted " << m_atomicEntries.size()
+                  << " atomic clouds across " << totalMols << " molecules in "
+                  << std::fixed << std::setprecision(2) << elapsedMs << " ms.\n";
+    }
+
+    void generateAtomicCloudsFor(size_t molIdx)
+    {
+        if (molIdx >= m_entries.size())
+        {
+            std::cout << "[AtomicStore] Error: Molecule index " << molIdx << " out of range.\n";
+            return;
+        }
+        const auto &mol = m_entries[molIdx];
+
+        for (size_t i = 0; i < mol.atoms.size(); ++i)
+        {
+            const auto &centerAtom = mol.atoms[i];
+
+            AtomicCloudEntry atomicCloud;
+            atomicCloud.id = m_nextAtomicId++;
+            atomicCloud.parentMoleculeIdx = molIdx;
+            atomicCloud.atomIndex = i;
+            atomicCloud.symbol = centerAtom.symbol;
+            atomicCloud.name = mol.filename + "_" + centerAtom.symbol + std::to_string(i);
+
+            atomicCloud.atoms.reserve(mol.atoms.size());
+            // Shift coordinates precisely so the chosen central atom is at (0,0,0)
+            for (size_t j = 0; j < mol.atoms.size(); ++j)
+            {
+                AtomRecord shifted = mol.atoms[j];
+                shifted.x -= centerAtom.x;
+                shifted.y -= centerAtom.y;
+                shifted.z -= centerAtom.z;
+                atomicCloud.atoms.push_back(shifted);
+            }
+            atomicCloud.numAtoms = atomicCloud.atoms.size();
+            m_atomicEntries.push_back(std::move(atomicCloud));
+        }
+    }
+
+    void clearAtomicClouds()
+    {
+        // Quietly remove ONLY the atomic clouds that were actually rendered in Polyscope (no spam)
+        for (const auto &ac : m_atomicEntries)
+        {
+            std::string cloudName = "Molecule_" + std::to_string(ac.id + 1000000) + "_" + ac.name;
+            if (polyscope::hasPointCloud(cloudName))
+            {
+                polyscope::removePointCloud(cloudName, true);
+            }
+        }
+        m_atomicEntries.clear();
+        m_nextAtomicId = 0;
+        std::cout << "[AtomicStore] Cleared all atomic neighborhood clouds.\n";
+    }
+
+    size_t atomicSize() const { return m_atomicEntries.size(); }
+
+    std::string getAtomicName(size_t index) const
+    {
+        if (index >= m_atomicEntries.size())
+            return "";
+        return m_atomicEntries[index].name;
+    }
+
+    size_t getAtomicAtomCount(size_t index) const
+    {
+        if (index >= m_atomicEntries.size())
+            return 0;
+        return m_atomicEntries[index].numAtoms;
+    }
+
+    bool visualizeAtomicIndex(size_t index) const
+    {
+        if (index >= m_atomicEntries.size())
+        {
+            std::cout << "[AtomicStore] Error: Atomic index " << index << " out of range.\n";
+            return false;
+        }
+        const auto &ac = m_atomicEntries[index];
+
+        // Pass false for autoCenter so the central atom stays at (0,0,0)
+        PolyscopeBridge::visualizeMolecule(ac.id + 1000000, ac.name, ac.atoms, false);
+
+        std::cout << "[Polyscope] Rendered atomic neighborhood (centered on atom): " << ac.name << "\n";
+        return true;
+    }
+
+    bool unviewAtomicIndex(size_t index) const
+    {
+        if (index >= m_atomicEntries.size())
+            return false;
+        const auto &ac = m_atomicEntries[index];
+        PolyscopeBridge::removeVisualization(ac.id + 1000000, ac.name);
+        return true;
+    }
 
     void ensureDescriptorsUpToDate()
     {
@@ -343,7 +783,7 @@ public:
         m_faissManager.printDistanceDistribution();
     }
 
-  bool printPairAlignmentWithStats(size_t idxA, size_t idxB, AlignmentOptions opt = AlignmentOptions())
+    bool printPairAlignmentWithStats(size_t idxA, size_t idxB, AlignmentOptions opt = AlignmentOptions())
     {
         if (idxA >= m_entries.size() || idxB >= m_entries.size())
         {
@@ -404,7 +844,7 @@ public:
         std::cout << "  Time Elapsed     : " << std::fixed << std::setprecision(3) << elapsedMs << " ms\n";
         std::cout << "  Matching Pairs   : " << res.matching.size() << " atoms matched\n";
         std::cout << "-------------------------------------------------------\n";
-        
+
         // Print matching in compressed array format: [0, 1, 2, 3, ...]
         std::cout << "  Atom Mapping     : [";
         for (size_t i = 0; i < res.matching.size(); ++i)
@@ -412,7 +852,7 @@ public:
             std::cout << res.matching[i] << (i + 1 < res.matching.size() ? ", " : "");
         }
         std::cout << "]\n";
-        
+
         std::cout << "=======================================================\n";
         std::cout << "  [Matching] Stored. Use 'show_match " << idxA << " " << idxB << "' to display it.\n\n";
         return true;
@@ -558,7 +998,7 @@ public:
         return res;
     }
 
-   void inspect(size_t index) const
+    void inspect(size_t index) const
     {
         if (index >= m_entries.size())
         {
@@ -644,6 +1084,7 @@ public:
 
     void clearAll()
     {
+        clearAtomicClouds();
         MatchingViz::clearAll();
         m_entries.clear();
         m_faissManager.clear();
@@ -745,7 +1186,9 @@ public:
 
 private:
     std::vector<MoleculeEntry> m_entries;
+    std::vector<AtomicCloudEntry> m_atomicEntries;
     size_t m_nextId = 0;
+    size_t m_nextAtomicId = 0;
     FaissIndexManager m_faissManager;
     std::vector<DupMatch> m_lastBatchMatches;
     bool m_descriptorsDirty = false;

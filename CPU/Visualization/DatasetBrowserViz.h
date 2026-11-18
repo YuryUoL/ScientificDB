@@ -4,7 +4,7 @@
 #include <vector>
 #include <map>
 #include <sstream>
-#include "MolecularDatasetStore.h"
+#include "CPU/MolecularDatasetStore.h"
 #include "PolyscopeBridge.h"
 
 namespace DatasetBrowserViz {
