@@ -17,6 +17,7 @@
 #include "Duplicatechecker.h"
 #include "Visualization/MolecularGraphViz.h"
 #include <oneapi/tbb/parallel_sort.h>
+#include "AtomicClassifier.h"
 
 struct MoleculeEntry
 {
@@ -49,7 +50,7 @@ public:
     MolecularDatasetStore() = default;
     ~MolecularDatasetStore() { clearAll(); }
 
-bool computeAtomicAlignerDistance(size_t idxA, size_t idxB, size_t N, const AlignmentOptions& opt = AlignmentOptions())
+    bool computeAtomicAlignerDistance(size_t idxA, size_t idxB, size_t N, const AlignmentOptions &opt = AlignmentOptions())
     {
         if (idxA >= m_atomicEntries.size() || idxB >= m_atomicEntries.size())
         {
@@ -66,35 +67,36 @@ bool computeAtomicAlignerDistance(size_t idxA, size_t idxB, size_t N, const Alig
             return false;
         }
 
-        // Cloud A subset: Take N closest atoms (EXCLUDING the centroid at index 0)
+        // Cloud A subset: Take N closest atoms (EXCLUDING the center atom at the origin)
         // sortedAtomIndices already excludes the center atom and is sorted by distance ascending.
-        std::vector<size_t> idxA_subset;
         size_t limitA = (N > 0) ? std::min(N, acA.sortedAtomIndices.size()) : acA.sortedAtomIndices.size();
-        for (size_t i = 0; i < limitA; ++i)
-        {
-            idxA_subset.push_back(acA.sortedAtomIndices[i]);
-        }
-
-        if (idxA_subset.empty())
+        if (limitA == 0)
         {
             std::cout << "[AtomicStore] Error: Cloud A subset is empty (N=0 or no neighbor atoms).\n";
             return false;
         }
 
-        // Cloud B subset: Take all atoms EXCEPT the centroid (skip index 0)
-        std::vector<size_t> idxB_subset;
-        for (size_t j = 0; j < acB.atoms.size(); ++j)
-        {
-            if (j == 0) continue; // Exclude centroid
-            idxB_subset.push_back(j);
-        }
+        // Cloud B subset: Take all atoms EXCEPT the center atom (which sits at the origin)
+        // sortedAtomIndices already excludes the center atom.
+        std::vector<size_t> idxB_subset = acB.sortedAtomIndices;
 
-        if (idxB_subset.size() < idxA_subset.size())
+        if (idxB_subset.empty())
         {
-            std::cout << "[AtomicStore] Error: Cloud B subset size (" << idxB_subset.size() 
-                      << ") is smaller than Cloud A subset size (" << idxA_subset.size() << ").\n";
+            std::cout << "[AtomicStore] Error: Cloud B subset is empty (no neighbor atoms).\n";
             return false;
         }
+
+        // If N is too large so |A| > |B|, print error and clamp A's neighbor count to |B|
+        if (idxB_subset.size() < limitA)
+        {
+            std::cout << "[AtomicStore] Error: Cloud B subset size (" << idxB_subset.size()
+                      << ") is smaller than Cloud A subset size (" << limitA
+                      << "). Clamping subset size to " << idxB_subset.size() << ".\n";
+            limitA = idxB_subset.size();
+        }
+
+        std::vector<size_t> idxA_subset(acA.sortedAtomIndices.begin(),
+                                        acA.sortedAtomIndices.begin() + limitA);
 
         // Convert atoms to Point3F
         std::vector<CloudAlignmentEvaluator::Point3F> cloudA(acA.atoms.size());
@@ -132,16 +134,77 @@ bool computeAtomicAlignerDistance(size_t idxA, size_t idxB, size_t N, const Alig
             return false;
         }
 
-        AtomicMatchingViz::store(idxA, idxB, acA.name, acB.name, res, idxA_subset, idxB_subset);
+        // Compute injective bottleneck distance on the aligned subset using AtomicBottleneckEvaluator
+        const size_t m = idxA_subset.size();
+        const size_t n = idxB_subset.size();
+        float bottleneckDist = res.bestBottleneck;
+        if (m <= AtomicBottleneckEvaluator::MAX_VERTICES && n <= AtomicBottleneckEvaluator::MAX_VERTICES)
+        {
+            // Apply res.rotation to cloudA subset points
+            const float *R = res.rotation;
+            std::vector<float> cost(m * n, std::numeric_limits<float>::infinity());
+            float lo = 0.0f;
+            float hi = 0.0f;
+
+            for (size_t i = 0; i < m; ++i)
+            {
+                const auto &pA = cloudA[idxA_subset[i]];
+                float ax = R[0] * pA.x + R[1] * pA.y + R[2] * pA.z;
+                float ay = R[3] * pA.x + R[4] * pA.y + R[5] * pA.z;
+                float az = R[6] * pA.x + R[7] * pA.y + R[8] * pA.z;
+
+                float rowMin = std::numeric_limits<float>::infinity();
+                float rowMax = 0.0f;
+                for (size_t j = 0; j < n; ++j)
+                {
+                    if (localOpt.requireSameSymbol && symbolsA[idxA_subset[i]] != symbolsB[idxB_subset[j]])
+                        continue;
+
+                    const auto &pB = cloudB[idxB_subset[j]];
+                    float dx = ax - pB.x;
+                    float dy = ay - pB.y;
+                    float dz = az - pB.z;
+                    float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    cost[i * n + j] = d;
+                    if (d < rowMin)
+                        rowMin = d;
+                    if (d > rowMax)
+                        rowMax = d;
+                }
+                if (rowMin < std::numeric_limits<float>::infinity() && rowMin > lo)
+                    lo = rowMin;
+                if (rowMax > hi)
+                    hi = rowMax;
+            }
+            if (lo <= hi && hi > 0.0f)
+            {
+                bottleneckDist = AtomicBottleneckEvaluator::bottleneckInjective(cost.data(), m, n, lo, hi);
+            }
+        }
+        else if (n <= AtomicBottleneckEvaluator::MAX_VERTICES)
+        {
+            // Fallback 1D sorted distance bottleneck when m > MAX_VERTICES
+            std::vector<float> dA(acA.sortedDistances.begin(), acA.sortedDistances.begin() + m);
+            std::vector<float> dB = acB.sortedDistances;
+            std::sort(dA.begin(), dA.end());
+            std::sort(dB.begin(), dB.end());
+            bottleneckDist = AtomicBottleneckEvaluator::injectiveBottleneck1D(dA.data(), m, dB.data(), n);
+        }
+
+        AtomicMatchingViz::store(
+            idxA, idxB,
+            acA.parentMoleculeIdx, acA.symbol, acA.atomIndex,
+            acB.parentMoleculeIdx, acB.symbol, acB.atomIndex,
+            res, idxA_subset, idxB_subset);
 
         std::cout << "\n=======================================================\n";
-        std::cout << "  ATOMIC CLOUD ALIGNMENT & MATCHING (aligner - NO CENTROIDS)\n";
+        std::cout << "  ATOMIC CLOUD ALIGNMENT & MATCHING (aligner - NO CENTER ATOMS)\n";
         std::cout << "=======================================================\n";
         std::cout << "  Atomic Cloud A   : " << idxA << " (" << acA.name << ")\n";
         std::cout << "  Atomic Cloud B   : " << idxB << " (" << acB.name << ")\n";
-        std::cout << "  Subset Size A    : " << idxA_subset.size() << " neighbor atoms (Centroid excluded)\n";
-        std::cout << "  Subset Size B    : " << idxB_subset.size() << " neighbor atoms (Centroid excluded)\n";
-        std::cout << "  Bottleneck Dist  : " << std::fixed << std::setprecision(6) << res.bestBottleneck << "\n";
+        std::cout << "  Subset Size A    : " << idxA_subset.size() << " neighbor atoms (Center excluded)\n";
+        std::cout << "  Subset Size B    : " << idxB_subset.size() << " neighbor atoms (Center excluded)\n";
+        std::cout << "  Bottleneck Dist  : " << std::fixed << std::setprecision(6) << bottleneckDist << "\n";
         std::cout << "  Time Elapsed     : " << std::fixed << std::setprecision(3) << elapsedMs << " ms\n";
         std::cout << "-------------------------------------------------------\n";
         std::cout << "  Atom Mapping     : [";
@@ -154,7 +217,6 @@ bool computeAtomicAlignerDistance(size_t idxA, size_t idxB, size_t N, const Alig
         std::cout << "  [AtomicMatching] Stored. Use 'apply_atomic_align " << idxA << " " << idxB << "' to rotate A into B.\n\n";
         return true;
     }
-
     // --- Compute Atomic Descriptors (SRV-analog & Sorted Index Array) ---
     void computeAtomicDescriptors()
     {
@@ -286,7 +348,7 @@ bool computeAtomicAlignerDistance(size_t idxA, size_t idxB, size_t N, const Alig
     }
 
     // --- Atomic Neighborhood Cloud Expansion & Management ---
-   void generateAllAtomicClouds()
+    void generateAllAtomicClouds()
     {
         m_atomicEntries.clear();
         size_t totalMols = m_entries.size();
@@ -348,7 +410,7 @@ bool computeAtomicAlignerDistance(size_t idxA, size_t idxB, size_t N, const Alig
             }
         }
 
-   // Merge thread-local results back into m_atomicEntries sequentially
+        // Merge thread-local results back into m_atomicEntries sequentially
         for (int tid = 0; tid < maxThreads; ++tid)
         {
             for (auto &ac : threadPoolEntries[tid])
@@ -358,11 +420,11 @@ bool computeAtomicAlignerDistance(size_t idxA, size_t idxB, size_t N, const Alig
         }
 
         // Parallel sort using Intel TBB (preserves file order and atom index order)
-        tbb::parallel_sort(m_atomicEntries.begin(), m_atomicEntries.end(), [](const auto &a, const auto &b) {
+        tbb::parallel_sort(m_atomicEntries.begin(), m_atomicEntries.end(), [](const auto &a, const auto &b)
+                           {
             if (a.parentMoleculeIdx != b.parentMoleculeIdx)
                 return a.parentMoleculeIdx < b.parentMoleculeIdx;
-            return a.atomIndex < b.atomIndex;
-        });
+            return a.atomIndex < b.atomIndex; });
 
         // Reassign clean contiguous IDs after sorting
         for (size_t i = 0; i < m_atomicEntries.size(); ++i)
@@ -413,22 +475,6 @@ bool computeAtomicAlignerDistance(size_t idxA, size_t idxB, size_t N, const Alig
         }
     }
 
-    void clearAtomicClouds()
-    {
-        // Quietly remove ONLY the atomic clouds that were actually rendered in Polyscope (no spam)
-        for (const auto &ac : m_atomicEntries)
-        {
-            std::string cloudName = "Molecule_" + std::to_string(ac.id + 1000000) + "_" + ac.name;
-            if (polyscope::hasPointCloud(cloudName))
-            {
-                polyscope::removePointCloud(cloudName, true);
-            }
-        }
-        m_atomicEntries.clear();
-        m_nextAtomicId = 0;
-        std::cout << "[AtomicStore] Cleared all atomic neighborhood clouds.\n";
-    }
-
     size_t atomicSize() const { return m_atomicEntries.size(); }
 
     std::string getAtomicName(size_t index) const
@@ -443,31 +489,6 @@ bool computeAtomicAlignerDistance(size_t idxA, size_t idxB, size_t N, const Alig
         if (index >= m_atomicEntries.size())
             return 0;
         return m_atomicEntries[index].numAtoms;
-    }
-
-    bool visualizeAtomicIndex(size_t index) const
-    {
-        if (index >= m_atomicEntries.size())
-        {
-            std::cout << "[AtomicStore] Error: Atomic index " << index << " out of range.\n";
-            return false;
-        }
-        const auto &ac = m_atomicEntries[index];
-
-        // Pass false for autoCenter so the central atom stays at (0,0,0)
-        PolyscopeBridge::visualizeMolecule(ac.id + 1000000, ac.name, ac.atoms, false);
-
-        std::cout << "[Polyscope] Rendered atomic neighborhood (centered on atom): " << ac.name << "\n";
-        return true;
-    }
-
-    bool unviewAtomicIndex(size_t index) const
-    {
-        if (index >= m_atomicEntries.size())
-            return false;
-        const auto &ac = m_atomicEntries[index];
-        PolyscopeBridge::removeVisualization(ac.id + 1000000, ac.name);
-        return true;
     }
 
     void ensureDescriptorsUpToDate()
@@ -1182,6 +1203,115 @@ bool computeAtomicAlignerDistance(size_t idxA, size_t idxB, size_t N, const Alig
         if (!desc || !desc->computed)
             return {};
         return desc->pdd;
+    }
+
+    void clearAtomicClouds()
+    {
+        for (size_t i = 0; i < m_atomicEntries.size(); ++i)
+        {
+            const auto &ac = m_atomicEntries[i];
+            std::string cloudName = AtomicMatchingViz::atomicCloudName(i, ac.parentMoleculeIdx, ac.symbol, ac.atomIndex);
+            if (polyscope::hasPointCloud(cloudName))
+            {
+                polyscope::removePointCloud(cloudName, true);
+            }
+        }
+        m_atomicEntries.clear();
+        m_nextAtomicId = 0;
+        std::cout << "[AtomicStore] Cleared all atomic neighborhood clouds.\n";
+    }
+
+    bool visualizeAtomicIndex(size_t index) const
+    {
+        if (index >= m_atomicEntries.size())
+        {
+            std::cout << "[AtomicStore] Error: Atomic index " << index << " out of range.\n";
+            return false;
+        }
+        const auto &ac = m_atomicEntries[index];
+        std::string cloudName = AtomicMatchingViz::atomicCloudName(index, ac.parentMoleculeIdx, ac.symbol, ac.atomIndex);
+
+        PolyscopeBridge::visualizeByName(cloudName, ac.atoms, false);
+
+        std::cout << "[Polyscope] Rendered atomic neighborhood (centered on atom): " << cloudName << "\n";
+        return true;
+    }
+
+    bool unviewAtomicIndex(size_t index) const
+    {
+        if (index >= m_atomicEntries.size())
+            return false;
+        const auto &ac = m_atomicEntries[index];
+        std::string cloudName = AtomicMatchingViz::atomicCloudName(index, ac.parentMoleculeIdx, ac.symbol, ac.atomIndex);
+        PolyscopeBridge::removeByName(cloudName);
+        return true;
+    }
+
+    std::vector<AtomicClassifyMatch> runBatchAtomicClassify(const std::string &csvPath,
+                                                            const AtomicClassifyParams &p,
+                                                            AtomicClassifyStats &st)
+    {
+        if (m_atomicEntries.empty())
+        {
+            generateAllAtomicClouds();
+        }
+        bool needDescriptors = false;
+        for (const auto &ac : m_atomicEntries)
+        {
+            if (!ac.descriptorsComputed)
+            {
+                needDescriptors = true;
+                break;
+            }
+        }
+        if (needDescriptors)
+        {
+            computeAtomicDescriptors();
+        }
+
+        AtomicClassifier classifier;
+        std::vector<AtomicClassifyMatch> matches = classifier.classifyAll(m_atomicEntries, p, st);
+
+        for (const auto &m : matches)
+        {
+            const auto &acA = m_atomicEntries[m.atomicIdxA];
+            const auto &acB = m_atomicEntries[m.atomicIdxB];
+
+            // ------------------ Direction 1: A -> B ------------------
+            size_t limitA = (p.N > 0) ? std::min(p.N, acA.sortedAtomIndices.size()) : acA.sortedAtomIndices.size();
+            if (acB.sortedAtomIndices.size() < limitA)
+                limitA = acB.sortedAtomIndices.size();
+
+            std::vector<size_t> idxA_subset(acA.sortedAtomIndices.begin(),
+                                            acA.sortedAtomIndices.begin() + limitA);
+
+            AtomicMatchingViz::store(
+                m.atomicIdxA, m.atomicIdxB,
+                acA.parentMoleculeIdx, acA.symbol, acA.atomIndex,
+                acB.parentMoleculeIdx, acB.symbol, acB.atomIndex,
+                m.alignAB, idxA_subset, acB.sortedAtomIndices);
+
+            // ------------------ Direction 2: B -> A ------------------
+            size_t limitB = (p.N > 0) ? std::min(p.N, acB.sortedAtomIndices.size()) : acB.sortedAtomIndices.size();
+            if (acA.sortedAtomIndices.size() < limitB)
+                limitB = acA.sortedAtomIndices.size();
+
+            std::vector<size_t> idxB_subset(acB.sortedAtomIndices.begin(),
+                                            acB.sortedAtomIndices.begin() + limitB);
+
+            AtomicMatchingViz::store(
+                m.atomicIdxB, m.atomicIdxA,
+                acB.parentMoleculeIdx, acB.symbol, acB.atomIndex,
+                acA.parentMoleculeIdx, acA.symbol, acA.atomIndex,
+                m.alignBA, idxB_subset, acA.sortedAtomIndices);
+        }
+
+        if (!csvPath.empty())
+        {
+            AtomicClassifier::writeCsv(csvPath, matches);
+        }
+
+        return matches;
     }
 
 private:

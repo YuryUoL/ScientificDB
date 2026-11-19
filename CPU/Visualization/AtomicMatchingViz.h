@@ -33,8 +33,10 @@ inline bool  s_showAllAtomicMatches = true;
 inline float s_atomicLineThickness  = 1.5f;
 inline float s_atomicLineColor[4]   = {0.1f, 0.9f, 0.8f, 0.9f};
 
-inline std::string atomicCloudName(size_t id, const std::string& name) {
-    return "Molecule_" + std::to_string(id + 1000000) + "_" + name;
+inline std::string atomicCloudName(size_t atomicIdx, size_t molIdx,
+                                   const std::string& symbol, size_t atomIdx) {
+    return "AtomicCloud_" + std::to_string(atomicIdx) + "_" +
+           std::to_string(molIdx) + "_" + symbol + std::to_string(atomIdx);
 }
 
 inline AtomicMatchRecord* find(size_t a, size_t b) {
@@ -58,14 +60,17 @@ inline void clearAll() {
     s_atomicMatches.clear();
 }
 
-inline void store(size_t idA, size_t idB, const std::string& nameA, const std::string& nameB,
-                  const SubsetAlignmentResult& res, const std::vector<size_t>& subA, const std::vector<size_t>& subB) {
+inline void store(size_t idA, size_t idB,
+                  size_t molIdxA, const std::string& symA, size_t atomIdxA,
+                  size_t molIdxB, const std::string& symB, size_t atomIdxB,
+                  const SubsetAlignmentResult& res,
+                  const std::vector<size_t>& subA, const std::vector<size_t>& subB) {
     remove(idA, idB);
     AtomicMatchRecord m;
     m.idA = idA;
     m.idB = idB;
-    m.nameA = atomicCloudName(idA, nameA);
-    m.nameB = atomicCloudName(idB, nameB);
+    m.nameA = atomicCloudName(idA, molIdxA, symA, atomIdxA);
+    m.nameB = atomicCloudName(idB, molIdxB, symB, atomIdxB);
     m.matching = res.matching;
     m.subsetIndicesA = subA;
     m.subsetIndicesB = subB;

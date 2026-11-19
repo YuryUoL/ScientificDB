@@ -260,4 +260,62 @@ namespace PolyscopeBridge {
             }
         }
     }
+
+    inline void visualizeByName(const std::string& cloudName, const std::vector<AtomRecord>& atoms, bool autoCenter = true) {
+        if (atoms.empty() || cloudName.empty()) return;
+
+        std::vector<glm::vec3> positions;
+        std::vector<glm::vec3> colors;
+        MoleculeLabels labelData;
+        positions.reserve(atoms.size());
+        colors.reserve(atoms.size());
+        labelData.labels.reserve(atoms.size());
+        labelData.isHydrogen.reserve(atoms.size());
+
+        glm::vec3 center(0.0f);
+        if (autoCenter) {
+            for (const auto& atom : atoms) {
+                center += glm::vec3(atom.x, atom.y, atom.z);
+            }
+            center /= static_cast<float>(atoms.size());
+        }
+
+        for (size_t i = 0; i < atoms.size(); ++i) {
+            const auto& atom = atoms[i];
+            glm::vec3 shiftedPos = glm::vec3(atom.x, atom.y, atom.z) - center;
+            positions.push_back(shiftedPos);
+
+            colors.push_back(getAtomColor(atom.symbol));
+            labelData.labels.push_back(atom.symbol + std::to_string(i + s_labelIndexBase));
+            labelData.isHydrogen.push_back(atom.symbol == "H");
+        }
+        labelData.localPositions = positions;
+
+        s_activeCloudName = cloudName;
+        polyscope::PointCloud* psCloud = polyscope::registerPointCloud(s_activeCloudName, positions);
+
+        auto* colorQ = psCloud->addColorQuantity("Element Colors", colors);
+        colorQ->setEnabled(true);
+
+        psCloud->setPointRadius(0.08f, true);
+        psCloud->setTransformGizmoEnabled(s_gizmosEnabled);
+
+        glm::mat4 initialTransform = glm::translate(glm::mat4(1.0f), center);
+        psCloud->setTransform(initialTransform);
+
+        s_labelData[s_activeCloudName] = std::move(labelData);
+    }
+
+    inline void removeByName(const std::string& cloudName) {
+        if (polyscope::hasPointCloud(cloudName)) {
+            polyscope::removePointCloud(cloudName, true);
+            s_labelData.erase(cloudName);
+            std::cout << "[Polyscope] Unviewed / removed structure: " << cloudName << "\n";
+            if (s_activeCloudName == cloudName) {
+                s_activeCloudName = "";
+            }
+        } else {
+            std::cout << "[Polyscope] Warning: Structure '" << cloudName << "' is not currently rendered.\n";
+        }
+    }
 }
