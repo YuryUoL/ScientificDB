@@ -1,13 +1,19 @@
 #include "DatasetCommands.h"
+#include "CPU/MolecularOperations.h"
+#include "CPU/AtomicOperations.h"
 #include "CPU/Readers/NpyReader.h"
 #include "CPU/SyntheticMoleculeGenerator.h"
 #include <filesystem>
 #include <iostream>
+#include <memory>
 
 namespace Commands
 {
     void registerDatasetCommands(CommandDispatcher &ui, MolecularDatasetStore &xyzStore)
     {
+        auto molOps = std::make_shared<MolecularOperations>(xyzStore);
+        auto atomOps = std::make_shared<AtomicOperations>(xyzStore);
+
         // loadXyz
         ui.registerCommand(
             "loadXyz", "<path_to_file_or_folder>",
@@ -53,7 +59,7 @@ namespace Commands
         ui.registerCommand(
             "loadAndCompute", "<path_to_file_or_folder>",
             "Loads single .xyz file or folder and automatically computes all descriptors.",
-            [&xyzStore](std::istringstream &iss)
+            [&xyzStore, molOps](std::istringstream &iss)
             {
                 std::string path;
                 iss >> std::ws;
@@ -95,7 +101,7 @@ namespace Commands
                 if (loaded)
                 {
                     std::cout << "[XyzStore] Automatically computing descriptors...\n";
-                    xyzStore.computeDescriptors();
+                    molOps->computeDescriptors();
                 }
             });
         ui.registerAlias("load_and_compute", "loadAndCompute");
@@ -177,11 +183,11 @@ namespace Commands
         ui.registerCommand(
             "removeXyz", "<index>",
             "Removes a molecule by its list index.",
-            [&xyzStore](std::istringstream &iss)
+            [molOps](std::istringstream &iss)
             {
                 size_t idx;
                 if (iss >> idx)
-                    xyzStore.removeByIndex(idx);
+                    molOps->removeByIndex(idx);
                 else
                     std::cout << "Usage: removeXyz <index>\n";
             });
@@ -210,21 +216,21 @@ namespace Commands
         ui.registerCommand(
             "expand_atoms", "",
             "Expands ALL loaded molecules into centered atomic neighborhood clouds.",
-            [&xyzStore](std::istringstream &)
+            [atomOps](std::istringstream &)
             {
-                xyzStore.generateAllAtomicClouds();
+                atomOps->generateAllAtomicClouds();
             });
 
         // Expand a specific molecule index
         ui.registerCommand(
             "expand_atom_idx", "<molecule_index>",
             "Expands only a single specified molecule index into atomic neighborhoods.",
-            [&xyzStore](std::istringstream &iss)
+            [atomOps](std::istringstream &iss)
             {
                 size_t idx;
                 if (iss >> idx)
                 {
-                    xyzStore.generateAtomicCloudsFor(idx);
+                    atomOps->generateAtomicCloudsFor(idx);
                     std::cout << "[AtomicStore] Expanded molecule index " << idx << ".\n";
                 }
                 else
@@ -237,21 +243,21 @@ namespace Commands
         ui.registerCommand(
             "clear_atoms", "",
             "Clears and deletes all generated atomic neighborhood clouds.",
-            [&xyzStore](std::istringstream &)
+            [atomOps](std::istringstream &)
             {
-                xyzStore.clearAtomicClouds();
+                atomOps->clearAtomicClouds();
             });
 
         // viewatomic <index>
         ui.registerCommand(
             "viewatomic", "<atomic_index>",
             "Visualizes an atomic neighborhood cloud by its index in Polyscope.",
-            [&xyzStore](std::istringstream &iss)
+            [atomOps](std::istringstream &iss)
             {
                 size_t idx;
                 if (iss >> idx)
                 {
-                    xyzStore.visualizeAtomicIndex(idx);
+                    atomOps->visualizeAtomicIndex(idx);
                 }
                 else
                 {
@@ -263,12 +269,12 @@ namespace Commands
         ui.registerCommand(
             "unviewatomic", "<atomic_index>",
             "Removes an atomic neighborhood cloud visualization from Polyscope.",
-            [&xyzStore](std::istringstream &iss)
+            [atomOps](std::istringstream &iss)
             {
                 size_t idx;
                 if (iss >> idx)
                 {
-                    xyzStore.unviewAtomicIndex(idx);
+                    atomOps->unviewAtomicIndex(idx);
                 }
                 else
                 {

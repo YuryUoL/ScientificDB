@@ -1,9 +1,13 @@
 #include "DatabaseCommands.h"
+#include "CPU/MolecularOperations.h"
 #include <iostream>
+#include <memory>
 
 #if USE_MYSQL
 namespace Commands {
 void registerDatabaseCommands(CommandDispatcher &ui, MolecularDatasetStore &xyzStore, DatabaseConnection &dbConn) {
+    auto molOps = std::make_shared<MolecularOperations>(xyzStore);
+
     // db_connect
     ui.registerCommand(
         "db_connect", "<host> <user> <pass> <db>",
@@ -39,7 +43,7 @@ void registerDatabaseCommands(CommandDispatcher &ui, MolecularDatasetStore &xyzS
     ui.registerCommand(
         "db_push", "[include_descriptors: 0/1]",
         "Uploads all currently loaded local RAM molecules into MariaDB blobs.",
-        [&dbConn, &xyzStore](std::istringstream &iss) {
+        [&dbConn, &xyzStore, molOps](std::istringstream &iss) {
             if (!dbConn.isConnected()) {
                 std::cout << "[Database] Error: Not connected. Run 'db_connect' first.\n";
                 return;
@@ -64,9 +68,9 @@ void registerDatabaseCommands(CommandDispatcher &ui, MolecularDatasetStore &xyzS
 
                 std::vector<float> sdv, srv, pdd;
                 if (includeDesc) {
-                    sdv = xyzStore.getSDV(i);
-                    srv = xyzStore.getSRV(i);
-                    pdd = xyzStore.getPDD(i);
+                    sdv = molOps->getSDV(i);
+                    srv = molOps->getSRV(i);
+                    pdd = molOps->getPDD(i);
                 }
 
                 if (repo.saveMolecule(filename, atomCount, comment, rawXyz, sdv, srv, pdd)) {

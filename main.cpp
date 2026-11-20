@@ -15,6 +15,9 @@
 
 #include "CPU/CommandDispatcher.h"
 #include "CPU/MolecularDatasetStore.h"
+#include "CPU/MolecularDatasetStore.h"
+#include "CPU/MolecularOperations.h"
+
 #include "CPU/Visualization/AtomicMatchingViz.h"
 #include "CPU/Visualization/PolyscopeBridge.h"
 #include "CPU/Visualization/Matchingvisualizer.h"
@@ -148,7 +151,7 @@ int main(int argc, char *argv[])
                        { g_running = false; });
     ui.registerAlias("exit", "quit");
 
-    if (argc >= 2)
+  if (argc >= 2)
     {
         std::string initialPath = argv[1];
         bool autoCompute = (argc >= 3 && (std::string(argv[2]) == "--compute" || std::string(argv[2]) == "-c"));
@@ -163,7 +166,8 @@ int main(int argc, char *argv[])
         }
         if (autoCompute)
         {
-            xyzStore.computeDescriptors();
+            MolecularOperations molOps(xyzStore);
+            molOps.computeDescriptors();
         }
     }
 

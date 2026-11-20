@@ -1,4 +1,6 @@
 #include "AnalysisCommands.h"
+#include "CPU/MolecularOperations.h"
+#include "CPU/AtomicOperations.h"
 #include "CPU/Visualization/AtomicMatchingViz.h"
 #include "CPU/Duplicatechecker.h"
 #include "CPU/Visualization/PolyscopeBridge.h"
@@ -8,33 +10,34 @@
 #include <iomanip>
 #include <omp.h>
 
-#include <omp.h>
-
 namespace Commands
 {
     void registerAnalysisCommands(CommandDispatcher &ui, MolecularDatasetStore &xyzStore)
     {
+        auto molOps = std::make_shared<MolecularOperations>(xyzStore);
+        auto atomOps = std::make_shared<AtomicOperations>(xyzStore);
+
         // ComputeDescriptors
         ui.registerCommand(
             "ComputeDescriptors", "",
             "Computes SDV, SRV, and PDD descriptors in parallel.",
-            [&xyzStore](std::istringstream &)
-            { xyzStore.computeDescriptors(); });
+            [molOps](std::istringstream &)
+            { molOps->computeDescriptors(); });
         ui.registerAlias("compute", "ComputeDescriptors");
 
         // FlushDescriptors
         ui.registerCommand(
             "FlushDescriptors", "",
             "Deletes and flushes all computed descriptors and FAISS indices.",
-            [&xyzStore](std::istringstream &)
-            { xyzStore.flushDescriptors(); });
+            [molOps](std::istringstream &)
+            { molOps->flushDescriptors(); });
         ui.registerAlias("flush", "FlushDescriptors");
 
         // knn
         ui.registerCommand(
             "knn", "<index> <k_or_pct> [metric: sdv/srv] [csv_file]",
             "Finds k neighbors using FAISS L2 search.",
-            [&xyzStore](std::istringstream &iss)
+            [molOps](std::istringstream &iss)
             {
                 size_t idx;
                 std::string kStr = "5", metric = "srv", csvPath = "";
@@ -45,7 +48,7 @@ namespace Commands
                         iss >> metric;
                         iss >> csvPath;
                     }
-                    xyzStore.searchKNN(idx, kStr, metric, csvPath, false);
+                    molOps->searchKNN(idx, kStr, metric, csvPath, false);
                 }
                 else
                 {
@@ -58,7 +61,7 @@ namespace Commands
         ui.registerCommand(
             "chain", "<index> <k_or_pct> [metric: sdv/srv] [csv_file]",
             "Finds k neighbors restricted to previous survivors.",
-            [&xyzStore](std::istringstream &iss)
+            [molOps](std::istringstream &iss)
             {
                 size_t idx;
                 std::string kStr = "5", metric = "sdv", csvPath = "";
@@ -69,7 +72,7 @@ namespace Commands
                         iss >> metric;
                         iss >> csvPath;
                     }
-                    xyzStore.searchKNN(idx, kStr, metric, csvPath, true);
+                    molOps->searchKNN(idx, kStr, metric, csvPath, true);
                 }
                 else
                 {
@@ -82,7 +85,7 @@ namespace Commands
         ui.registerCommand(
             "pair_dist", "<index1> <index2> [metric: srv/sdv/pdd/aligner] [key=val ...]",
             "Computes exact distance metric or full rigid alignment.",
-            [&xyzStore](std::istringstream &iss)
+            [molOps](std::istringstream &iss)
             {
                 size_t idx1, idx2;
                 std::string metric = "pdd";
@@ -100,12 +103,12 @@ namespace Commands
                             if (eq != std::string::npos)
                                 opt.set(token.substr(0, eq), token.substr(eq + 1));
                         }
-                        xyzStore.printPairAlignmentWithStats(idx1, idx2, opt);
+                        molOps->printPairAlignmentWithStats(idx1, idx2, opt);
                     }
                     else
                     {
                         auto tStart = std::chrono::high_resolution_clock::now();
-                        float dist = xyzStore.computePairMetric(idx1, idx2, metric);
+                        float dist = molOps->computePairMetric(idx1, idx2, metric);
                         auto tEnd = std::chrono::high_resolution_clock::now();
                         double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
                         if (dist >= 0.0f)
@@ -139,7 +142,7 @@ namespace Commands
         ui.registerCommand(
             "dup_check", "<index|all> [epsilon|csv_file] [key=val ...]",
             "Checks for molecular duplicates against the DB.",
-            [&xyzStore](std::istringstream &iss)
+            [molOps](std::istringstream &iss)
             {
                 std::string arg1;
                 if (!(iss >> arg1))
@@ -175,7 +178,7 @@ namespace Commands
                         }
                     }
                     DupRunStats st;
-                    auto matches = xyzStore.runBatchDuplicateCheck(csvPath, p, st);
+                    auto matches = molOps->runBatchDuplicateCheck(csvPath, p, st);
                     DuplicateChecker::printBatchReport(p, st, matches, csvPath);
                 }
                 else
@@ -207,7 +210,7 @@ namespace Commands
                         }
                     }
                     DupRunStats st;
-                    auto matches = xyzStore.runDuplicateCheck(idx, csvPath, p, st);
+                    auto matches = molOps->runDuplicateCheck(idx, csvPath, p, st);
                     DuplicateChecker::printReport(idx, p, st, matches);
                 }
             },
@@ -236,12 +239,12 @@ namespace Commands
         ui.registerCommand(
             "knn_all", "<k_or_pct> <metric: sdv/srv> <csv_file>",
             "Computes k-nearest neighbors for ALL molecules and prints terminal tables + CSV.",
-            [&xyzStore](std::istringstream &iss)
+            [molOps](std::istringstream &iss)
             {
                 std::string kStr = "100%", metric = "srv", csvPath = "";
                 if (iss >> kStr >> metric >> csvPath)
                 {
-                    xyzStore.searchKNNForAll(kStr, metric, csvPath);
+                    molOps->searchKNNForAll(kStr, metric, csvPath);
                 }
                 else
                 {
@@ -254,9 +257,9 @@ namespace Commands
         ui.registerCommand(
             "dist_summary", "",
             "Prints distance distribution stats, a 10-bin ASCII histogram, and outliers for the last search.",
-            [&xyzStore](std::istringstream &)
+            [molOps](std::istringstream &)
             {
-                xyzStore.printDistanceDistribution();
+                molOps->printDistanceDistribution();
             });
         ui.registerAlias("dist_stats", "dist_summary");
         ui.registerAlias("histogram", "dist_summary");
@@ -265,11 +268,11 @@ namespace Commands
         ui.registerCommand(
             "view", "<index>",
             "Renders a specific loaded molecule as a colored point cloud in the Polyscope viewer.",
-            [&xyzStore](std::istringstream &iss)
+            [molOps](std::istringstream &iss)
             {
                 size_t idx;
                 if (iss >> idx)
-                    xyzStore.visualizeIndex(idx);
+                    molOps->visualizeIndex(idx);
                 else
                     std::cout << "Usage: view <index>\n";
             });
@@ -279,11 +282,11 @@ namespace Commands
         ui.registerCommand(
             "unview", "<index>",
             "Removes a specific rendered molecule point cloud from the Polyscope viewer.",
-            [&xyzStore](std::istringstream &iss)
+            [molOps](std::istringstream &iss)
             {
                 size_t idx;
                 if (iss >> idx)
-                    xyzStore.unviewIndex(idx);
+                    molOps->unviewIndex(idx);
                 else
                     std::cout << "Usage: unview <index>\n";
             });
@@ -329,17 +332,17 @@ namespace Commands
         };
 
         pairCmd("show_match", "Shows the stored matching lines between two molecules.",
-                [&xyzStore](size_t a, size_t b)
-                { xyzStore.setMatchVisible(a, b, true); });
+                [molOps](size_t a, size_t b)
+                { molOps->setMatchVisible(a, b, true); });
         pairCmd("hide_match", "Hides the matching lines.",
-                [&xyzStore](size_t a, size_t b)
-                { xyzStore.setMatchVisible(a, b, false); });
+                [molOps](size_t a, size_t b)
+                { molOps->setMatchVisible(a, b, false); });
         pairCmd("rm_match", "Deletes the stored matching for a pair from memory.",
-                [&xyzStore](size_t a, size_t b)
-                { xyzStore.removeMatch(a, b); });
+                [molOps](size_t a, size_t b)
+                { molOps->removeMatch(a, b); });
         pairCmd("apply_align", "Snaps cloud A onto cloud B using the stored rotation.",
-                [&xyzStore](size_t a, size_t b)
-                { xyzStore.applyAlignment(a, b); });
+                [molOps](size_t a, size_t b)
+                { molOps->applyAlignment(a, b); });
 
         ui.registerCommand("list_matches", "", "Lists all stored matchings.",
                            [](std::istringstream &)
@@ -348,49 +351,50 @@ namespace Commands
                            [](std::istringstream &)
                            { MatchingViz::clearAll(); });
         ui.registerCommand("show_matches", "", "Shows all stored matchings.",
-                           [&xyzStore](std::istringstream &)
-                           { xyzStore.setAllMatchesVisible(true); });
+                           [molOps](std::istringstream &)
+                           { molOps->setAllMatchesVisible(true); });
         ui.registerCommand("hide_matches", "", "Hides all stored matchings.",
-                           [&xyzStore](std::istringstream &)
-                           { xyzStore.setAllMatchesVisible(false); });
+                           [molOps](std::istringstream &)
+                           { molOps->setAllMatchesVisible(false); });
 
         // Cluster & Network Graph Commands
         ui.registerCommand(
             "explore_clusters", "",
             "Computes connected components from the last duplicate check and opens an interactive table window.",
-            [&xyzStore](std::istringstream &)
-            { xyzStore.exploreClusters(); });
+            [molOps](std::istringstream &)
+            { molOps->exploreClusters(); });
         ui.registerAlias("clusters", "explore_clusters");
 
         ui.registerCommand("show_graph", "", "Shows the duplicate network graph in Polyscope.",
-                           [&xyzStore](std::istringstream &)
+                           [molOps](std::istringstream &)
                            {
-                               xyzStore.setGraphVisible(true);
+                               molOps->setGraphVisible(true);
                                std::cout << "[Polyscope] Duplicate graph shown.\n";
                            });
         ui.registerCommand("hide_graph", "", "Hides the duplicate network graph in Polyscope.",
-                           [&xyzStore](std::istringstream &)
+                           [molOps](std::istringstream &)
                            {
-                               xyzStore.setGraphVisible(false);
+                               molOps->setGraphVisible(false);
                                std::cout << "[Polyscope] Duplicate graph hidden.\n";
                            });
         ui.registerCommand("clear_graph", "", "Removes the duplicate network graph and its labels.",
-                           [&xyzStore](std::istringstream &)
-                           { xyzStore.clearGraph(); });
+                           [molOps](std::istringstream &)
+                           { molOps->clearGraph(); });
         ui.registerAlias("rm_graph", "clear_graph");
+
         // ComputeAtomicDescriptors
         ui.registerCommand(
             "ComputeAtomicDescriptors", "",
             "Computes centroid distance descriptors and sorted index arrays for all atomic clouds.",
-            [&xyzStore](std::istringstream &)
-            { xyzStore.computeAtomicDescriptors(); });
+            [atomOps](std::istringstream &)
+            { atomOps->computeAtomicDescriptors(); });
         ui.registerAlias("compute_atoms", "ComputeAtomicDescriptors");
 
         // atomic_dist <index1> <index2> [metric: srv/aligner] [N=val] [key=val ...]
         ui.registerCommand(
             "atomic_dist", "<index1> <index2> [metric: srv/aligner] [N=val] [key=val ...]",
             "Computes Linf distance or rigid subset alignment between two atomic clouds.",
-            [&xyzStore](std::istringstream &iss)
+            [atomOps](std::istringstream &iss)
             {
                 size_t idx1, idx2;
                 if (iss >> idx1 >> idx2)
@@ -432,12 +436,12 @@ namespace Commands
 
                     if (metric == "aligner")
                     {
-                        xyzStore.computeAtomicAlignerDistance(idx1, idx2, N, opt);
+                        atomOps->computeAtomicAlignerDistance(idx1, idx2, N, opt);
                     }
                     else
                     {
                         auto tStart = std::chrono::high_resolution_clock::now();
-                        float dist = xyzStore.computeAtomicPairDistance(idx1, idx2, metric, N);
+                        float dist = atomOps->computeAtomicPairDistance(idx1, idx2, metric, N);
                         auto tEnd = std::chrono::high_resolution_clock::now();
                         double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
                         if (dist >= 0.0f)
@@ -469,7 +473,7 @@ namespace Commands
         ui.registerAlias("atomicDist", "atomic_dist");
 
         ui.registerCommand("apply_atomic_align", "<idxA> <idxB>", "Rotates atomic cloud A onto B using the computed alignment.",
-                           [&xyzStore](std::istringstream &iss)
+                           [](std::istringstream &iss)
                            {
                                size_t a, b;
                                if (iss >> a >> b)
@@ -479,7 +483,7 @@ namespace Commands
                            });
 
         ui.registerCommand("show_atomic_match", "<idxA> <idxB>", "Shows subset matching lines between two atomic clouds.",
-                           [&xyzStore](std::istringstream &iss)
+                           [](std::istringstream &iss)
                            {
                                size_t a, b;
                                if (iss >> a >> b)
@@ -488,7 +492,7 @@ namespace Commands
                                    std::cout << "Usage: show_atomic_match <idxA> <idxB>\n";
                            });
         ui.registerCommand("hide_atomic_match", "<idxA> <idxB>", "Hides subset matching lines.",
-                           [&xyzStore](std::istringstream &iss)
+                           [](std::istringstream &iss)
                            {
                                size_t a, b;
                                if (iss >> a >> b)
@@ -498,96 +502,254 @@ namespace Commands
                            });
 
         ui.registerCommand(
-        "atomic_classify", "[all] [epsilon|csv_file] [N=val] [key=val ...]",
-        "Runs batch classification across all atomic neighborhood clouds.",
-        [&xyzStore](std::istringstream &iss)
-        {
-            std::string csvPath = "atomic_matches.csv";
-            AtomicClassifyParams p;
-            std::string token;
-
-            while (iss >> token)
+            "atomic_classify", "[all] [epsilon|csv_file] [N=val] [key=val ...]",
+            "Runs batch classification across all atomic neighborhood clouds.",
+            [atomOps](std::istringstream &iss)
             {
-                if (token == "all")
-                    continue; // optional syntactic sugar matching dup_check
+                std::string csvPath = "atomic_matches.csv";
+                AtomicClassifyParams p;
+                std::string token;
 
-                size_t eq = token.find('=');
-                if (eq != std::string::npos)
+                while (iss >> token)
                 {
-                    std::string key = token.substr(0, eq);
-                    std::string val = token.substr(eq + 1);
+                    if (token == "all")
+                        continue;
 
-                    // Allow explicit csv=... or out=... syntax
-                    if (key == "csv" || key == "out" || key == "file")
+                    size_t eq = token.find('=');
+                    if (eq != std::string::npos)
                     {
-                        csvPath = val;
+                        std::string key = token.substr(0, eq);
+                        std::string val = token.substr(eq + 1);
+
+                        if (key == "csv" || key == "out" || key == "file")
+                        {
+                            csvPath = val;
+                        }
+                        else
+                        {
+                            p.set(key, val);
+                        }
+                    }
+                    else if (token.find(".csv") != std::string::npos)
+                    {
+                        csvPath = token;
                     }
                     else
                     {
-                        p.set(key, val);
+                        try
+                        {
+                            p.epsilon = std::stof(token);
+                        }
+                        catch (...)
+                        {
+                        }
                     }
                 }
-                else if (token.find(".csv") != std::string::npos)
-                {
-                    csvPath = token;
-                }
-                else
-                {
-                    try
-                    {
-                        p.epsilon = std::stof(token);
-                    }
-                    catch (...)
-                    {
-                    }
-                }
-            }
 
-            // -------------------------------------------------------------
-            // PRE-LAUNCH PARAMETER VERIFICATION BANNER
-            // -------------------------------------------------------------
-            std::cout << "\n=======================================================\n"
-                      << "  LAUNCHING ATOMIC BATCH CLASSIFICATION\n"
-                      << "=======================================================\n"
-                      << "  CSV Export Path     : " << (csvPath.empty() ? "(none / disabled)" : csvPath) << "\n"
-                      << "  Epsilon (epsilon)   : " << std::fixed << std::setprecision(4) << p.epsilon << " A\n"
-                      << "  Neighbors (N)       : " << (p.N == 0 ? "ALL neighbors" : std::to_string(p.N)) << "\n"
-                      << "  Consider Same Type  : " << (p.considerSame ? "true (all pairs)" : "false (different center types only)") << "\n"
-                      << "  Optimal Aligner     : " << (p.optimal ? "true (exact bottleneck)" : "false (fast early-exit <= eps)") << "\n"
-                      << "  Species Constraint  : " << (p.requireSameNeighborSpecies ? "true (elements must match)" : "false") << "\n"
-                      << "  Kabsch Refinement   : " << p.refineIterations << " rounds\n"
-                      << "  SRV Factor (srvf)   : " << std::fixed << std::setprecision(2) << p.srvFactor << "x (limit: " << (p.srvFactor * p.epsilon) << " A)\n"
-                      << "  Align Factor (alignf: " << std::fixed << std::setprecision(2) << p.alignFactor << "x (limit: " << (p.alignFactor * p.epsilon) << " A)\n"
-                      << "  Slack Tol (tol)     : " << p.relTol << "\n"
-                      << "  Max Matches Stored  : " << (p.maxMatches == 0 ? "ALL" : std::to_string(p.maxMatches)) << "\n"
-                      << "  Execution Mode      : " << (p.parallel ? "Parallel (OpenMP)" : "Single-threaded")
-                      << " (threads: " << (p.numThreads > 0 ? std::to_string(p.numThreads) : "auto/max") << ")\n"
-                      << "=======================================================\n\n" << std::flush;
+                std::cout << "\n=======================================================\n"
+                          << "  LAUNCHING ATOMIC BATCH CLASSIFICATION\n"
+                          << "=======================================================\n"
+                          << "  CSV Export Path     : " << (csvPath.empty() ? "(none / disabled)" : csvPath) << "\n"
+                          << "  Epsilon (epsilon)   : " << std::fixed << std::setprecision(4) << p.epsilon << " A\n"
+                          << "  Neighbors (N)       : " << (p.N == 0 ? "ALL neighbors" : std::to_string(p.N)) << "\n"
+                          << "  Consider Same Type  : " << (p.considerSame ? "true (all pairs)" : "false (different center types only)") << "\n"
+                          << "  Optimal Aligner     : " << (p.optimal ? "true (exact bottleneck)" : "false (fast early-exit <= eps)") << "\n"
+                          << "  Species Constraint  : " << (p.requireSameNeighborSpecies ? "true (elements must match)" : "false") << "\n"
+                          << "  Kabsch Refinement   : " << p.refineIterations << " rounds\n"
+                          << "  SRV Factor (srvf)   : " << std::fixed << std::setprecision(2) << p.srvFactor << "x (limit: " << (p.srvFactor * p.epsilon) << " A)\n"
+                          << "  Align Factor (alignf: " << std::fixed << std::setprecision(2) << p.alignFactor << "x (limit: " << (p.alignFactor * p.epsilon) << " A)\n"
+                          << "  Slack Tol (tol)     : " << p.relTol << "\n"
+                          << "  Max Matches Stored  : " << (p.maxMatches == 0 ? "ALL" : std::to_string(p.maxMatches)) << "\n"
+                          << "  Execution Mode      : " << (p.parallel ? "Parallel (OpenMP)" : "Single-threaded")
+                          << " (threads: " << (p.numThreads > 0 ? std::to_string(p.numThreads) : "auto/max") << ")\n"
+                          << "=======================================================\n\n"
+                          << std::flush;
 
-            AtomicClassifyStats st;
-            auto matches = xyzStore.runBatchAtomicClassify(csvPath, p, st);
-            AtomicClassifier::printBatchReport(p, st, matches, csvPath);
-        },
-        "  Parameters & Runtime Options:\n"
-        "    epsilon        : Max bottleneck distance threshold in Angstroms (default: 0.10)\n"
-        "    N=<int>        : Number of nearest non-center neighbor atoms to compare (default: 4)\n"
-        "    same=<0/1>     : 1 = compare all pairs; 0 = only compare different center types (default: 0)\n"
-        "    optimal=<0/1>  : 1 = exact minimum bottleneck; 0 = fast early-exit aligner (default: 0)\n"
-        "    species=<0/1>  : Require matched neighbor atoms to have identical element symbols (default: 0)\n"
-        "    refine=<int>   : Kabsch alignment refinement rounds (default: 0)\n"
-        "    srvf=<float>   : Stage 1 SRV L_inf radius multiplier factor (default: 1.0)\n"
-        "    alignf=<float> : Stage 2 Aligner bottleneck multiplier factor (default: 1.0)\n"
-        "    tol=<float>    : Floating-point noise slack tolerance (default: 1e-4)\n"
-        "    max=<int>      : Keep only top K best matches, 0 = all (default: 0)\n"
-        "    threads=<int>  : OpenMP thread count override, 0 = max available (default: 0)\n"
-        "    parallel=<0/1> : Enable/disable multi-threaded candidate evaluation (default: 1)\n\n"
-        "  Runtime Usage Examples:\n"
-        "    atomic_classify 0.10 N=4\n"
-        "    atomic_classify 0.08 my_custom_output.csv N=6 same=1 species=1 refine=2\n"
-        "    atomic_classify all 0.05 csv=results.csv optimal=1 max=50 parallel=1");
+                AtomicClassifyStats st;
+                auto matches = atomOps->runBatchAtomicClassify(csvPath, p, st);
+                AtomicClassifier::printBatchReport(p, st, matches, csvPath);
+            },
+            "  Parameters & Runtime Options:\n"
+            "    epsilon        : Max bottleneck distance threshold in Angstroms (default: 0.10)\n"
+            "    N=<int>        : Number of nearest non-center neighbor atoms to compare (default: 4)\n"
+            "    same=<0/1>     : 1 = compare all pairs; 0 = only compare different center types (default: 0)\n"
+            "    optimal=<0/1>  : 1 = exact minimum bottleneck; 0 = fast early-exit aligner (default: 0)\n"
+            "    species=<0/1>  : Require matched neighbor atoms to have identical element symbols (default: 0)\n"
+            "    refine=<int>   : Kabsch alignment refinement rounds (default: 0)\n"
+            "    srvf=<float>   : Stage 1 SRV L_inf radius multiplier factor (default: 1.0)\n"
+            "    alignf=<float> : Stage 2 Aligner bottleneck multiplier factor (default: 1.0)\n"
+            "    tol=<float>    : Floating-point noise slack tolerance (default: 1e-4)\n"
+            "    max=<int>      : Keep only top K best matches, 0 = all (default: 0)\n"
+            "    threads=<int>  : OpenMP thread count override, 0 = max available (default: 0)\n"
+            "    parallel=<0/1> : Enable/disable multi-threaded candidate evaluation (default: 1)\n\n"
+            "  Runtime Usage Examples:\n"
+            "    atomic_classify 0.10 N=4\n"
+            "    atomic_classify 0.08 my_custom_output.csv N=6 same=1 species=1 refine=2\n"
+            "    atomic_classify all 0.05 csv=results.csv optimal=1 max=50 parallel=1");
 
         ui.registerAlias("atomicClassify", "atomic_classify");
         ui.registerAlias("classify_atoms", "atomic_classify");
         ui.registerAlias("classifyAtoms", "atomic_classify");
+
+        ui.registerCommand(
+    "atomic_express", "[epsilon] [N=val] [key=val ...] [verify]",
+    "Fast Stage-1-only SRV pair counter (optional CSV export + Stage-2 aligner). "
+    "Prints per-label duplicate counts (C-O, C-N, ...).",
+    [atomOps](std::istringstream &iss)
+    {
+        AtomicExpressParams p;
+        bool verify = false;
+        std::string token;
+
+        while (iss >> token)
+        {
+            if (token == "verify" || token == "check" || token == "oracle")
+            {
+                verify = true;
+                continue;
+            }
+
+            const size_t eq = token.find('=');
+            if (eq != std::string::npos)
+            {
+                const std::string key = token.substr(0, eq);
+                const std::string val = token.substr(eq + 1);
+
+                auto toBool = [](const std::string &v) {
+                    return v == "1" || v == "true" || v == "on" || v == "yes";
+                };
+
+                if (key == "N" || key == "n")
+                {
+                    try { p.N = std::stoul(val); } catch (...) {}
+                }
+                else if (key == "eps" || key == "epsilon")
+                {
+                    try { p.epsilon = std::stof(val); } catch (...) {}
+                }
+                else if (key == "same")
+                {
+                    p.considerSame = toBool(val);
+                }
+                else if (key == "srvf")
+                {
+                    try { p.srvFactor = std::stof(val); } catch (...) {}
+                }
+                else if (key == "tol")
+                {
+                    try { p.relTol = std::stof(val); } catch (...) {}
+                }
+                else if (key == "grid")
+                {
+                    try { p.gridDim = std::stoi(val); } catch (...) {}
+                }
+                else if (key == "threads")
+                {
+                    try { p.numThreads = std::stoi(val); } catch (...) {}
+                }
+                else if (key == "parallel")
+                {
+                    p.parallel = toBool(val);
+                }
+                // ---- CSV export ----
+                else if (key == "csv" || key == "out" || key == "file")
+                {
+                    p.csvPath = val;
+                }
+                else if (key == "names")
+                {
+                    p.csvIncludeCloudNames = toBool(val);
+                }
+                else if (key == "counts")
+                {
+                    p.csvIncludeAtomCounts = toBool(val);
+                }
+                // ---- Stage-2 aligner ----
+                else if (key == "align" || key == "aligner" || key == "stage2")
+                {
+                    p.runAligner = toBool(val);
+                }
+                else if (key == "optimal" || key == "opt" || key == "exact")
+                {
+                    p.optimal = toBool(val);
+                }
+                else if (key == "alignf")
+                {
+                    try { p.alignFactor = std::stof(val); } catch (...) {}
+                }
+                else if (key == "species")
+                {
+                    p.requireSameNeighborSpecies = toBool(val);
+                }
+                else if (key == "refine")
+                {
+                    try { p.refineIterations = std::stoi(val); } catch (...) {}
+                }
+                else if (key == "max")
+                {
+                    try { p.maxMatches = std::stoul(val); } catch (...) {}
+                }
+                else
+                {
+                    std::cout << "[AtomicExpress] Unknown key '" << key << "', ignored.\n";
+                }
+            }
+            else if (token.find(".csv") != std::string::npos)
+            {
+                // bare path ending in .csv -> treat as CSV output
+                p.csvPath = token;
+            }
+            else
+            {
+                // bare number -> epsilon (matches dup_check / atomic_classify convention)
+                try { p.epsilon = std::stof(token); } catch (...) {}
+            }
+        }
+
+        // Guardrails: maxMatches only means something when the aligner runs
+        if (p.maxMatches > 0 && !p.runAligner)
+        {
+            std::cout << "[AtomicExpress] Note: 'max=' requires 'align=1'; ignoring maxMatches.\n";
+            p.maxMatches = 0;
+        }
+
+        atomOps->runAtomicExpressCount(p, verify);
+    },
+    "  Stage-1 (SRV) parameters:\n"
+    "    epsilon        : Max SRV L_inf threshold in Angstroms (default: 0.10)\n"
+    "    N=<int>        : Number of nearest non-center neighbor dims to compare (default: 4)\n"
+    "    same=<0/1>     : 1 = compare all pairs; 0 = only different center types (default: 0)\n"
+    "    srvf=<float>   : Stage-1 SRV radius multiplier factor (default: 1.0)\n"
+    "    tol=<float>    : Floating-point noise slack tolerance (default: 1e-4)\n"
+    "    grid=<int>     : Grid dimensionality cap, 1..4 (default: 4)\n"
+    "    threads=<int>  : OpenMP thread override, 0 = max available (default: 0)\n"
+    "    parallel=<0/1> : Enable/disable multi-threaded execution (default: 1)\n\n"
+    "  CSV export (optional, off unless csv= is given):\n"
+    "    csv=<path>     : Write materialised pair list to this CSV (also accepts a bare '*.csv')\n"
+    "    names=<0/1>    : Include cloud names in CSV (default: 1)\n"
+    "    counts=<0/1>   : Include atom counts in CSV (default: 1)\n\n"
+    "  Stage-2 aligner (optional, off unless align=1):\n"
+    "    align=<0/1>    : Run bidirectional subset aligner on each Stage-1 survivor (default: 0)\n"
+    "    optimal=<0/1>  : 1 = exact minimum bottleneck; 0 = fast early-exit (default: 0)\n"
+    "    alignf=<float> : Aligner bottleneck radius multiplier factor (default: 1.0)\n"
+    "    species=<0/1>  : Require matched neighbor atoms to have identical element symbols (default: 0)\n"
+    "    refine=<int>   : Kabsch refinement rounds (default: 0)\n"
+    "    max=<int>      : Keep only top-K best aligned pairs, 0 = all (default: 0; requires align=1)\n\n"
+    "  Other:\n"
+    "    verify         : Also run O(M^2) brute-force oracle and diff results (default: off)\n\n"
+    "  Examples:\n"
+    "    atomic_express\n"
+    "    atomic_express 0.08 N=6\n"
+    "    atomic_express 0.10 same=1 grid=3 threads=16\n"
+    "    atomic_express 0.05 N=4 verify\n"
+    "    atomic_express csv=pairs.csv\n"
+    "    atomic_express csv=pairs.csv names=0 counts=0\n"
+    "    atomic_express align=1\n"
+    "    atomic_express align=1 csv=verified.csv N=4 optimal=1 species=1 refine=4 max=200\n"
+    "    atomic_express align=1 alignf=2.0 optimal=0 threads=16");
+        ui.registerAlias("express", "atomic_express");
+        ui.registerAlias("countPairs", "atomic_express");
+        ui.registerAlias("atomicExpress", "atomic_express");
     }
+
 } // namespace Commands

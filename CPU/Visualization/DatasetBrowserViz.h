@@ -5,6 +5,7 @@
 #include <map>
 #include <sstream>
 #include "CPU/MolecularDatasetStore.h"
+#include "CPU/MolecularOperations.h"
 #include "PolyscopeBridge.h"
 
 namespace DatasetBrowserViz {
@@ -63,6 +64,7 @@ namespace DatasetBrowserViz {
 
                 ImGuiListClipper clipper;
                 clipper.Begin(static_cast<int>(totalMols));
+                MolecularOperations molOps(store);
                 while (clipper.Step()) {
                     for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
                         const size_t i = static_cast<size_t>(row);
@@ -92,11 +94,11 @@ namespace DatasetBrowserViz {
                         ImGui::TableSetColumnIndex(4);
                         ImGui::PushID(row);
                         if (ImGui::Button("View")) {
-                            store.visualizeIndex(i);
+                            molOps.visualizeIndex(i);
                         }
                         ImGui::SameLine();
                         if (ImGui::Button("Hide")) {
-                            store.unviewIndex(i);
+                            molOps.unviewIndex(i);
                         }
                         ImGui::PopID();
                     }

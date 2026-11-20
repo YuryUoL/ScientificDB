@@ -12,12 +12,16 @@ namespace AtomicBrowserViz {
 
 // Include the full store definition AFTER the function signature
 #include "CPU/MolecularDatasetStore.h"
+#include "CPU/AtomicOperations.h"
+
 
 namespace AtomicBrowserViz {
     inline void drawWindow(MolecularDatasetStore& store) {
         if (!s_windowVisible) return;
 
-        const size_t totalAtomic = store.atomicSize();
+        AtomicOperations atomOps(store);
+
+        const size_t totalAtomic = atomOps.atomicSize();
 
         ImGui::SetNextWindowSize(ImVec2(650, 450), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("Atomic Neighborhood Browser", &s_windowVisible)) {
@@ -46,19 +50,19 @@ namespace AtomicBrowserViz {
                         ImGui::Text("%zu", i);
 
                         ImGui::TableSetColumnIndex(1);
-                        ImGui::TextUnformatted(store.getAtomicName(i).c_str());
+                        ImGui::TextUnformatted(atomOps.getAtomicName(i).c_str());
 
                         ImGui::TableSetColumnIndex(2);
-                        ImGui::Text("%zu", store.getAtomicAtomCount(i));
+                       ImGui::Text("%zu", atomOps.getAtomicAtomCount(i));
 
                         ImGui::TableSetColumnIndex(3);
                         ImGui::PushID(row + 500000);
                         if (ImGui::Button("View")) {
-                            store.visualizeAtomicIndex(i);
+                            atomOps.visualizeAtomicIndex(i);
                         }
                         ImGui::SameLine();
                         if (ImGui::Button("Hide")) {
-                            store.unviewAtomicIndex(i);
+                            atomOps.unviewAtomicIndex(i);
                         }
                         ImGui::PopID();
                     }

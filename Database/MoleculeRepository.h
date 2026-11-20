@@ -1,5 +1,7 @@
 #pragma once
 #include "DatabaseConnection.h"
+#include "../CPU/MolecularDatasetStore.h"
+#include "../CPU/MolecularOperations.h"
 #include <vector>
 #include <string>
 #include <sstream>
@@ -29,6 +31,7 @@ public:
         }
         return true;
     }
+
     // Clears all stored molecules from the database instantly
     bool clearDatabase() {
         MYSQL* conn = m_db.getHandle();
@@ -120,7 +123,7 @@ public:
         return true;
     }
 
-    size_t loadAllIntoMemory(class MolecularDatasetStore& store, bool includeDescriptors = true) {
+    size_t loadAllIntoMemory(MolecularDatasetStore& store, bool includeDescriptors = true) {
         MYSQL* conn = m_db.getHandle();
         
         std::string query = "SELECT filename, xyz_blob FROM molecules";
@@ -156,7 +159,8 @@ public:
         
         if (includeDescriptors && loadedCount > 0) {
             std::cout << "[XyzStore] Automatically re-computing descriptors for pulled dataset...\n";
-            store.computeDescriptors();
+            MolecularOperations molOps(store);
+            molOps.computeDescriptors();
         }
 
         return loadedCount;

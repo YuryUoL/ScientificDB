@@ -10,6 +10,7 @@
 #include <imgui.h>
 #include "PolyscopeBridge.h"
 #include "CPU/Duplicatechecker.h"
+#include "polyscope/curve_network.h"
 
 class MolecularGraphViz
 {
