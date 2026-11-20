@@ -614,14 +614,30 @@ public:
                         if (wantPairs)
                         {
                             AtomicExpressResult::PairRecord rec;
-                            rec.idxA = idA;
-                            rec.idxB = pCloudId[q];
-                            if (rec.idxA > rec.idxB)
-                                std::swap(rec.idxA, rec.idxB);
-                            rec.symbolA = uniq[std::min(ta, tq)];
-                            rec.symbolB = uniq[std::max(ta, tq)];
-                            rec.lenA = la;
-                            rec.lenB = pLen[q];
+
+                            // Orient the pair by cloud index FIRST, then carry symbols/lengths
+                            // so that symbolA/lenA always describe clouds[rec.idxA] and
+                            // symbolB/lenB always describe clouds[rec.idxB].
+                            uint32_t idLo = idA;
+                            uint32_t idHi = pCloudId[q];
+                            uint16_t symLo = ta;
+                            uint16_t symHi = tq;
+                            uint16_t lenLo = la;
+                            uint16_t lenHi = pLen[q];
+
+                            if (idLo > idHi)
+                            {
+                                std::swap(idLo, idHi);
+                                std::swap(symLo, symHi);
+                                std::swap(lenLo, lenHi);
+                            }
+
+                            rec.idxA = idLo;
+                            rec.idxB = idHi;
+                            rec.symbolA = uniq[symLo];
+                            rec.symbolB = uniq[symHi];
+                            rec.lenA = lenLo;
+                            rec.lenB = lenHi;
                             rec.srvDist = maxDiff;
                             L.pairs.push_back(std::move(rec));
                         }
