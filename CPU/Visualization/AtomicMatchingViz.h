@@ -2,6 +2,8 @@
 
 #include <vector>
 #include <string>
+#include <unordered_map>
+#include <cstdint>
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
@@ -29,9 +31,22 @@ struct AtomicMatchRecord {
 };
 
 inline std::vector<AtomicMatchRecord> s_atomicMatches;
+inline std::unordered_map<uint64_t, size_t> s_matchIndex;
 inline bool  s_showAllAtomicMatches = true;
 inline float s_atomicLineThickness  = 1.5f;
 inline float s_atomicLineColor[4]   = {0.1f, 0.9f, 0.8f, 0.9f};
+
+inline uint64_t makePairKey(size_t a, size_t b) {
+    return (static_cast<uint64_t>(a) << 32) | static_cast<uint32_t>(b);
+}
+
+inline void rebuildIndex() {
+    s_matchIndex.clear();
+    s_matchIndex.reserve(s_atomicMatches.size());
+    for (size_t i = 0; i < s_atomicMatches.size(); ++i) {
+        s_matchIndex[makePairKey(s_atomicMatches[i].idA, s_atomicMatches[i].idB)] = i;
+    }
+}
 
 inline std::string atomicCloudName(size_t atomicIdx, size_t molIdx,
                                    const std::string& symbol, size_t atomIdx) {
@@ -40,24 +55,47 @@ inline std::string atomicCloudName(size_t atomicIdx, size_t molIdx,
 }
 
 inline AtomicMatchRecord* find(size_t a, size_t b) {
-    for (auto& m : s_atomicMatches) {
-        if (m.idA == a && m.idB == b) return &m;
+    if (s_matchIndex.size() != s_atomicMatches.size()) {
+        rebuildIndex();
     }
-    return nullptr;
+    auto it = s_matchIndex.find(makePairKey(a, b));
+    if (it == s_matchIndex.end() || it->second >= s_atomicMatches.size()) {
+        return nullptr;
+    }
+    AtomicMatchRecord* rec = &s_atomicMatches[it->second];
+    if (rec->idA != a || rec->idB != b) {
+        rebuildIndex();
+        it = s_matchIndex.find(makePairKey(a, b));
+        return (it != s_matchIndex.end()) ? &s_atomicMatches[it->second] : nullptr;
+    }
+    return rec;
 }
 
 inline bool remove(size_t a, size_t b) {
-    for (size_t i = 0; i < s_atomicMatches.size(); ++i) {
-        if (s_atomicMatches[i].idA == a && s_atomicMatches[i].idB == b) {
-            s_atomicMatches.erase(s_atomicMatches.begin() + i);
-            return true;
-        }
+    if (s_matchIndex.size() != s_atomicMatches.size()) {
+        rebuildIndex();
     }
-    return false;
+    const uint64_t key = makePairKey(a, b);
+    auto it = s_matchIndex.find(key);
+    if (it == s_matchIndex.end()) {
+        return false;
+    }
+
+    const size_t idx = it->second;
+    const size_t lastIdx = s_atomicMatches.size() - 1;
+    if (idx != lastIdx) {
+        s_atomicMatches[idx] = std::move(s_atomicMatches[lastIdx]);
+        const uint64_t movedKey = makePairKey(s_atomicMatches[idx].idA, s_atomicMatches[idx].idB);
+        s_matchIndex[movedKey] = idx;
+    }
+    s_atomicMatches.pop_back();
+    s_matchIndex.erase(it);
+    return true;
 }
 
 inline void clearAll() {
     s_atomicMatches.clear();
+    s_matchIndex.clear();
 }
 
 inline void store(size_t idA, size_t idB,
@@ -65,7 +103,6 @@ inline void store(size_t idA, size_t idB,
                   size_t molIdxB, const std::string& symB, size_t atomIdxB,
                   const SubsetAlignmentResult& res,
                   const std::vector<size_t>& subA, const std::vector<size_t>& subB) {
-    remove(idA, idB);
     AtomicMatchRecord m;
     m.idA = idA;
     m.idB = idB;
@@ -77,7 +114,15 @@ inline void store(size_t idA, size_t idB,
     m.bottleneck = res.bestBottleneck;
     for (int i = 0; i < 9; ++i) m.R[i] = res.rotation[i];
     m.visible = false;
-    s_atomicMatches.push_back(std::move(m));
+
+    const uint64_t key = makePairKey(idA, idB);
+    if (auto* existing = find(idA, idB)) {
+        *existing = std::move(m);
+    } else {
+        const size_t newIdx = s_atomicMatches.size();
+        s_atomicMatches.push_back(std::move(m));
+        s_matchIndex[key] = newIdx;
+    }
 }
 
 inline void drawLines() {
@@ -141,23 +186,23 @@ inline void install() {
 }
 
 inline bool applyAlignment(size_t idA, size_t idB) {
-    for (auto& m : s_atomicMatches) {
-        if (m.idA != idA || m.idB != idB) continue;
-        if (!polyscope::hasPointCloud(m.nameA) || !polyscope::hasPointCloud(m.nameB)) {
-            std::cout << "[AtomicMatching] Both atomic clouds must be viewed first.\n";
-            return false;
-        }
-        glm::mat4 R4(1.0f);
-        for (int r = 0; r < 3; ++r)
-            for (int c = 0; c < 3; ++c)
-                R4[c][r] = m.R[r * 3 + c];
-
-        glm::mat4 TB = polyscope::getPointCloud(m.nameB)->getTransform();
-        polyscope::getPointCloud(m.nameA)->setTransform(TB * R4);
-        return true;
+    AtomicMatchRecord* m = find(idA, idB);
+    if (!m) {
+        std::cout << "[AtomicMatching] No stored atomic matching for this pair.\n";
+        return false;
     }
-    std::cout << "[AtomicMatching] No stored atomic matching for this pair.\n";
-    return false;
+    if (!polyscope::hasPointCloud(m->nameA) || !polyscope::hasPointCloud(m->nameB)) {
+        std::cout << "[AtomicMatching] Both atomic clouds must be viewed first.\n";
+        return false;
+    }
+    glm::mat4 R4(1.0f);
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            R4[c][r] = m->R[r * 3 + c];
+
+    glm::mat4 TB = polyscope::getPointCloud(m->nameB)->getTransform();
+    polyscope::getPointCloud(m->nameA)->setTransform(TB * R4);
+    return true;
 }
 
 inline void setVisible(size_t idA, size_t idB, bool v) {

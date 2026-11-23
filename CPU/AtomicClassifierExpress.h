@@ -27,9 +27,24 @@
 //    always uses the original float descriptor values.
 //
 //  Optional features (all off by default, zero cost when disabled):
+//    * BATCHED pipeline: Stage-1 candidates are streamed into fixed-size batches
+//      (auto-sized from a RAM budget, or fixed manually). Each batch can fire the
+//      Stage-2 aligner and free its memory before the next batch is built. This
+//      bounds peak RAM to O(batch) + O(survivors), instead of O(all candidates).
+//    * Progress tracing + RSS sampling (opt-in, thread-safe, rate-limited).
+//      traceProgress = phase markers + count start/end + flush start/end
+//      traceVerbose  = per-flush start lines + per-batch detail
+//      traceIntervalSec = rate limit for tick/progress lines (default 0.5s)
 //    * CSV export of the materialised pair list, with cloud names and atom counts.
 //    * Stage-2 bidirectional subset aligner (identical options and defaults to
 //      AtomicClassifyParams), so the express result can be verified end-to-end.
+//
+//  Note on maxMatches:
+//    When runAligner == false, maxMatches is ignored (Stage-1 candidates are
+//    never truncated). When runAligner == true and topKGlobal == false, the
+//    top-K is applied PER BATCH (memory-bounded, non-deterministic order across
+//    batches). Set topKGlobal == true to merge survivors and apply a single
+//    global top-K at the end (deterministic, RAM = O(all aligned survivors)).
 //
 //  Note on N > 4:
 //    The 64-bit packed key allows at most 4 coordinates at 15 bits each, so the
@@ -54,6 +69,8 @@
 #include <cassert>
 #include <fstream>
 #include <sstream>
+#include <mutex>
+#include <queue>
 #include <omp.h>
 
 #include <unordered_map>
@@ -62,11 +79,148 @@
 #include "Aligners/AtomicCloudAlignmentEvaluator.h"
 #include "Aligners/AtomicBottleneckEvaluator.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <psapi.h>
+#else
+#include <unistd.h>
+#endif
+
 #if __has_include(<oneapi/tbb/parallel_sort.h>) && __has_include(<oneapi/tbb/global_control.h>)
 #include <oneapi/tbb/parallel_sort.h>
 #include <oneapi/tbb/global_control.h>
 #define ATOMIC_EXPRESS_HAVE_TBB 1
 #endif
+
+// =============================================================================
+//  Small utilities: RSS sampling + thread-safe, rate-limited tracer
+// =============================================================================
+namespace atomic_express_detail
+{
+    // Resident set size in bytes; 0 if unsupported.
+    inline size_t currentRssBytes()
+    {
+#if defined(_WIN32)
+        PROCESS_MEMORY_COUNTERS pmc{};
+        if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+            return static_cast<size_t>(pmc.WorkingSetSize);
+        return 0;
+#elif defined(__linux__) || defined(__APPLE__)
+        std::ifstream f("/proc/self/statm");
+        size_t total = 0, rss = 0;
+        if (f >> total >> rss)
+        {
+            const long page = sysconf(_SC_PAGESIZE);
+            if (page > 0)
+                return rss * static_cast<size_t>(page);
+        }
+        return 0;
+#else
+        return 0;
+#endif
+    }
+
+    // Total physical RAM in bytes; 0 if unknown.
+    inline size_t totalRamBytes()
+    {
+#if defined(_WIN32)
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms))
+            return static_cast<size_t>(ms.ullTotalPhys);
+        return 0;
+#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+        const long pages = sysconf(_SC_PHYS_PAGES);
+        const long page = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && page > 0)
+            return static_cast<size_t>(pages) * static_cast<size_t>(page);
+        return 0;
+#else
+        return 0;
+#endif
+    }
+
+    // Thread-safe, rate-limited tracer.
+    //
+    //  phase(msg)     -> unconditional marker (start/end of a stage)
+    //  force(msg)     -> unconditional line (same as phase; kept for clarity)
+    //  line(msg)      -> alias of force() — kept for backwards compatibility
+    //                    with earlier call sites
+    //  tick(msg)      -> prints only if >= minIntervalSec since last print
+    //  progress(l,d,t)-> prints "label  x.y%  (d/t)  eta N.Ns"  (rate-limited)
+    //
+    // NOTE: phase() intentionally takes NO result argument — a previous version
+    // forward-declared `struct AtomicExpressResult` inside this namespace, which
+    // created a DIFFERENT type from the global ::AtomicExpressResult and broke
+    // every call site.  Keeping only the message sidesteps that.
+    struct Trace
+    {
+        bool enabled = false;
+        bool mem = false;
+        bool verbose = false;
+        double minIntervalSec = 0.5;
+        double t0 = 0.0;
+        mutable double lastPrint = 0.0;
+        mutable std::mutex mu;
+
+        Trace() : t0(omp_get_wtime()) {}
+        Trace(bool en, bool m) : enabled(en), mem(m), t0(omp_get_wtime()) {}
+
+        void phase(const std::string &msg) const { force(msg); }
+
+        void force(const std::string &msg) const
+        {
+            if (!enabled)
+                return;
+            std::lock_guard<std::mutex> lk(mu);
+            printLocked(msg);
+        }
+
+        // Backwards-compatible alias for force().
+        void line(const std::string &msg) const { force(msg); }
+
+        void tick(const std::string &msg) const
+        {
+            if (!enabled)
+                return;
+            const double now = omp_get_wtime();
+            std::lock_guard<std::mutex> lk(mu);
+            if (now - lastPrint < minIntervalSec)
+                return;
+            lastPrint = now;
+            printLocked(msg);
+        }
+
+        void progress(const std::string &label, uint64_t done, uint64_t total) const
+        {
+            if (!enabled || total == 0)
+                return;
+            const double now = omp_get_wtime();
+            std::lock_guard<std::mutex> lk(mu);
+            if (now - lastPrint < minIntervalSec)
+                return;
+            lastPrint = now;
+            const double frac = static_cast<double>(done) / static_cast<double>(total);
+            const double elapsed = now - t0;
+            const double eta = frac > 1e-6 ? elapsed * (1.0 - frac) / frac : 0.0;
+            std::ostringstream os;
+            os << label << "  " << std::fixed << std::setprecision(1)
+               << (frac * 100.0) << "%  (" << done << "/" << total << ")"
+               << "  eta " << std::setprecision(1) << eta << "s";
+            printLocked(os.str());
+        }
+
+    private:
+        void printLocked(const std::string &msg) const
+        {
+            const double t = omp_get_wtime() - t0;
+            std::cout << "[trace " << std::fixed << std::setprecision(3) << t << "s] " << msg;
+            if (mem)
+                std::cout << "  rss=" << (currentRssBytes() >> 20) << "MiB";
+            std::cout << std::endl;
+        }
+    };
+} // namespace atomic_express_detail
 
 // =============================================================================
 //  Parameters
@@ -83,6 +237,27 @@ struct AtomicExpressParams
     bool parallel = true;
     int gridDim = 4; // grid dimensionality cap (1..4)
 
+    // ---- Progress / tracing (opt-in) ----
+    bool traceProgress = false;
+    bool traceMemory = false;
+    bool traceVerbose = false;     // per-flush start lines / extra detail
+    double traceIntervalSec = 0.5; // rate limit for tick/progress lines
+    int traceEveryTables = 1;
+
+    // ---- Batching ----
+    // If both batchPairs and batchBytes are 0:
+    //   autoTuneRam==true  -> AUTO (sized from free RAM)
+    //   autoTuneRam==false -> disabled (legacy: materialize everything)
+    //
+    // If batchPairs > 0                -> MANUAL, use it
+    // If batchBytes > 0 (and pairs==0) -> MANUAL via bytes
+    // batchBytes == SIZE_MAX           -> force AUTO path
+    size_t batchPairs = 0;
+    size_t batchBytes = 0;
+    bool pipelineAlign = true; // run aligner per-batch when runAligner == true
+    bool topKGlobal = true;    // global top-K (deterministic); false = per-batch
+    bool autoTuneRam = true;   // if both batch sizes are 0, auto-pick one
+
     // ---- CSV export (all off unless csvPath non-empty) ----
     std::string csvPath; // empty => no CSV
     bool csvIncludeCloudNames = true;
@@ -95,6 +270,8 @@ struct AtomicExpressParams
     bool requireSameNeighborSpecies = false;
     int refineIterations = 0;
     size_t maxMatches = 0; // 0 = all (only when runAligner == true)
+
+    bool storeViz = true;
 };
 
 // =============================================================================
@@ -117,16 +294,26 @@ struct AtomicExpressResult
     uint64_t maxOccupancy = 0;
     double avgOccupancy = 0.0;
 
-    double msIndex = 0, msSort = 0, msCells = 0, msCount = 0, msAlign = 0, msTotal = 0;
+    // ---- Batching telemetry ----
+    uint64_t batches = 0;           // number of Stage-2 flushes performed
+    uint64_t batchPairsFlushed = 0; // total Stage-1 candidates sent to flushes
+    uint64_t peakBatchPairs = 0;    // largest single batch size seen
+    size_t peakRssBytes = 0;        // peak RSS observed (only when traceMemory)
+    size_t batchBudgetBytes = 0;    // the effective budget used for sizing
+    size_t effectiveBatchPairs = 0; // 0 == batching disabled
+
+    // ---- Timing breakdown (all in ms) ----
+    double msIndex       = 0;  // stage-0 compaction + grid geometry
+    double msSort        = 0;  // per-table entry sort
+    double msCells       = 0;  // per-table cell/hash construction
+    double msCount       = 0;  // per-table exact SRV counting
+    double msMaterialize = 0;  // metadata fill + batch flushes (incl. aligner)
+    double msAlign       = 0;  // stage-2 aligner only (subset of msMaterialize)
+    double msTotal       = 0;  // wall clock of countCrossLabelPairs() — NO CSV write
+    double msWithoutCsv  = 0;  // == msTotal (explicit; writeCsv is a separate call)
+    double msCsvWrite    = 0;  // filled only by timedWriteCsv()
 
     // Materialised pairs (filled only when csvPath is set or runAligner == true).
-    //
-    // When runAligner == false:  R.pairs contains every Stage-1 survivor, with
-    //                            aligned == false and empty alignAB/alignBA.
-    // When runAligner == true:   R.pairs contains only the pairs that survived
-    //                            BOTH Stage-1 SRV and Stage-2 bidirectional
-    //                            aligner (aligned == true), with valid
-    //                            SubsetAlignmentResult rotations in both dirs.
     struct PairRecord
     {
         size_t idxA = 0, idxB = 0;
@@ -170,6 +357,9 @@ public:
     {
         AtomicExpressResult R;
         const double tAll = omp_get_wtime();
+        atomic_express_detail::Trace TR(p.traceProgress, p.traceMemory);
+        TR.verbose = p.traceVerbose;
+        TR.minIntervalSec = std::max(0.0, p.traceIntervalSec);
         const int nt = p.parallel ? (p.numThreads > 0 ? p.numThreads : omp_get_max_threads()) : 1;
         R.threads = nt;
         R.totalClouds = clouds.size();
@@ -177,8 +367,12 @@ public:
         oneapi::tbb::global_control gc(oneapi::tbb::global_control::max_allowed_parallelism, static_cast<size_t>(nt));
 #endif
         const size_t n = clouds.size();
+        TR.phase("begin: " + std::to_string(n) + " clouds, threads=" + std::to_string(nt));
         if (n < 2)
             return R;
+
+        // ---- resolve batch sizing ----
+        resolveBatchSizing(p, R, TR);
 
         // ---------------- Stage 0: compact valid clouds into flat arrays ----------------
         double t0 = omp_get_wtime();
@@ -261,6 +455,9 @@ public:
         std::vector<uint16_t>().swap(lenAll);
         std::vector<uint32_t>().swap(src);
 
+        TR.phase("stage0 done (valid clouds compacted): M=" + std::to_string(M) +
+                 " T=" + std::to_string(T));
+
         // ---------------- grid geometry ----------------
         const int G = static_cast<int>(std::min<size_t>(
             static_cast<size_t>(std::max(1, std::min(p.gridDim, 4))), maxLen));
@@ -309,6 +506,10 @@ public:
             return static_cast<uint64_t>(std::floor((static_cast<double>(v) - vMinD) * invW)) + 2u;
         };
 
+        TR.phase("grid geometry ready: G=" + std::to_string(G) +
+                 " cellWidth=" + std::to_string(w) +
+                 " thr=" + std::to_string(thr));
+
         // ---- pair materialisation setup (zero cost if disabled) ----
         const bool wantPairs = !p.csvPath.empty() || p.runAligner;
 
@@ -337,6 +538,313 @@ public:
         std::vector<uint32_t> cellBegin, cellMid;
 
         const size_t NC = static_cast<size_t>(nt) * 4;
+
+        // ---- timing accumulators for the batch pipeline ----
+        double alignAccumMs = 0.0;
+        double materializeAccumMs = 0.0;
+
+        // ---- batch pipeline ----
+        struct BatchStore
+        {
+            std::vector<AtomicExpressResult::PairRecord> buf;   // current batch
+            std::vector<AtomicExpressResult::PairRecord> all;   // legacy: all
+            std::vector<AtomicExpressResult::PairRecord> kept;  // post-align survivors
+            uint64_t flushed = 0;
+        } B;
+
+        // Fill cloud-level metadata (names, atom counts, indices) for a record.
+        auto fillMetadata = [&](AtomicExpressResult::PairRecord &rec)
+        {
+            const auto &A = clouds[rec.idxA];
+            const auto &Bc = clouds[rec.idxB];
+            if (p.csvIncludeCloudNames)
+            {
+                rec.nameA = A.name;
+                rec.nameB = Bc.name;
+            }
+            if (p.csvIncludeAtomCounts)
+            {
+                rec.atomsInA = A.numAtoms;
+                rec.atomsInB = Bc.numAtoms;
+            }
+            rec.molIdxA = A.parentMoleculeIdx;
+            rec.atomIdxA = A.atomIndex;
+            rec.molIdxB = Bc.parentMoleculeIdx;
+            rec.atomIdxB = Bc.atomIndex;
+        };
+
+        const float rAlign = p.alignFactor * p.epsilon * (1.0f + p.relTol) + 1e-6f;
+        const auto MAXN = AtomicBottleneckEvaluator::MAX_VERTICES;
+
+        auto evalDirected = [&](const auto &srcAc,
+                                const std::vector<CloudAlignmentEvaluator::Point3F> &srcCloud,
+                                const std::vector<std::string> &srcSyms,
+                                const auto &dstAc,
+                                const std::vector<CloudAlignmentEvaluator::Point3F> &dstCloud,
+                                const std::vector<std::string> &dstSyms,
+                                SubsetAlignmentResult &out,
+                                float &outDist) -> bool
+        {
+            size_t limitSrc = (p.N > 0) ? std::min(p.N, srcAc.sortedAtomIndices.size())
+                                        : srcAc.sortedAtomIndices.size();
+            const auto &idxDst = dstAc.sortedAtomIndices;
+            if (limitSrc == 0 || idxDst.empty())
+                return false;
+            if (idxDst.size() < limitSrc)
+                limitSrc = idxDst.size();
+            std::vector<size_t> idxSrc(srcAc.sortedAtomIndices.begin(),
+                                       srcAc.sortedAtomIndices.begin() + limitSrc);
+
+            AlignmentOptions opt;
+            opt.exact = p.optimal;
+            opt.acceptDistance = p.optimal ? 0.0f : rAlign;
+            opt.refineIterations = p.refineIterations;
+            opt.requireSameSymbol = p.requireSameNeighborSpecies;
+            if (p.requireSameNeighborSpecies)
+            {
+                opt.symbolsA = &srcSyms;
+                opt.symbolsB = &dstSyms;
+            }
+
+            out = AtomicCloudAlignmentEvaluator::alignSubsetAndEvaluate(
+                srcCloud, idxSrc, dstCloud, idxDst, opt);
+            if (!out.success)
+                return false;
+            outDist = out.bestBottleneck;
+
+            const size_t mSub = idxSrc.size();
+            const size_t nSub = idxDst.size();
+            if (p.optimal && mSub <= MAXN && nSub <= MAXN && outDist <= rAlign)
+            {
+                const float *Rr = out.rotation;
+                std::vector<float> cost(mSub * nSub, std::numeric_limits<float>::infinity());
+                float lo = 0.0f, hi = 0.0f;
+                for (size_t i = 0; i < mSub; ++i)
+                {
+                    const auto &pA = srcCloud[idxSrc[i]];
+                    float ax = Rr[0] * pA.x + Rr[1] * pA.y + Rr[2] * pA.z;
+                    float ay = Rr[3] * pA.x + Rr[4] * pA.y + Rr[5] * pA.z;
+                    float az = Rr[6] * pA.x + Rr[7] * pA.y + Rr[8] * pA.z;
+                    float rowMin = std::numeric_limits<float>::infinity();
+                    float rowMax = 0.0f;
+                    for (size_t j = 0; j < nSub; ++j)
+                    {
+                        if (p.requireSameNeighborSpecies &&
+                            srcSyms[idxSrc[i]] != dstSyms[idxDst[j]])
+                            continue;
+                        const auto &pB = dstCloud[idxDst[j]];
+                        float dx = ax - pB.x, dy = ay - pB.y, dz = az - pB.z;
+                        float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                        cost[i * nSub + j] = d;
+                        if (d < rowMin)
+                            rowMin = d;
+                        if (d > rowMax)
+                            rowMax = d;
+                    }
+                    if (rowMin < std::numeric_limits<float>::infinity() && rowMin > lo)
+                        lo = rowMin;
+                    if (rowMax > hi)
+                        hi = rowMax;
+                }
+                if (lo <= hi && hi > 0.0f)
+                    outDist = AtomicBottleneckEvaluator::bottleneckInjective(
+                        cost.data(), mSub, nSub, lo, hi);
+                out.bestBottleneck = outDist;
+            }
+            return true;
+        };
+
+        // Align every record in `v` in place. Only aligned==true rows survive,
+        // and their alignAB/alignBA rotations are populated.
+        auto alignBatch = [&](std::vector<AtomicExpressResult::PairRecord> &v)
+        {
+            if (v.empty())
+                return;
+            const double ta0 = omp_get_wtime();
+            std::atomic<uint64_t> alignDone{0};
+            const uint64_t alignTotal = static_cast<uint64_t>(v.size());
+
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nt)
+            for (long long k = 0; k < static_cast<long long>(v.size()); ++k)
+            {
+                auto &rec = v[static_cast<size_t>(k)];
+                const auto &acA = clouds[rec.idxA];
+                const auto &acB = clouds[rec.idxB];
+
+                std::vector<CloudAlignmentEvaluator::Point3F> cloudA(acA.atoms.size()), cloudB(acB.atoms.size());
+                std::vector<std::string> symsA, symsB;
+                if (p.requireSameNeighborSpecies)
+                {
+                    symsA.resize(acA.atoms.size());
+                    symsB.resize(acB.atoms.size());
+                }
+                for (size_t i = 0; i < acA.atoms.size(); ++i)
+                {
+                    cloudA[i] = {(float)acA.atoms[i].x, (float)acA.atoms[i].y, (float)acA.atoms[i].z};
+                    if (p.requireSameNeighborSpecies)
+                        symsA[i] = acA.atoms[i].symbol;
+                }
+                for (size_t i = 0; i < acB.atoms.size(); ++i)
+                {
+                    cloudB[i] = {(float)acB.atoms[i].x, (float)acB.atoms[i].y, (float)acB.atoms[i].z};
+                    if (p.requireSameNeighborSpecies)
+                        symsB[i] = acB.atoms[i].symbol;
+                }
+
+                SubsetAlignmentResult rAB, rBA;
+                float dAB = std::numeric_limits<float>::infinity();
+                float dBA = std::numeric_limits<float>::infinity();
+
+                bool okAB = evalDirected(acA, cloudA, symsA, acB, cloudB, symsB, rAB, dAB);
+                bool okBA = evalDirected(acB, cloudB, symsB, acA, cloudA, symsA, rBA, dBA);
+
+                if (okAB && okBA)
+                {
+                    const float maxDist = std::max(dAB, dBA);
+                    rec.alignDistAB = dAB;
+                    rec.alignDistBA = dBA;
+                    rec.alignDist = maxDist;
+                    if (dAB > dBA)
+                        rec.alignDir = "A->B";
+                    else if (dBA > dAB)
+                        rec.alignDir = "B->A";
+                    else
+                        rec.alignDir = "equal";
+
+                    if (maxDist <= rAlign)
+                    {
+                        rec.aligned = true;
+                        rec.alignAB = std::move(rAB);
+                        rec.alignBA = std::move(rBA);
+                    }
+                }
+
+                if (p.traceProgress)
+                {
+                    const uint64_t c = ++alignDone;
+                    if ((c & 0x3FF) == 0) // throttle check every 1024
+                        TR.progress("align", c, alignTotal);
+                }
+            }
+            v.erase(std::remove_if(v.begin(), v.end(),
+                                   [](const auto &r)
+                                   { return !r.aligned; }),
+                    v.end());
+            if (p.maxMatches > 0 && !p.topKGlobal && v.size() > p.maxMatches)
+            {
+                std::sort(v.begin(), v.end(),
+                          [](const auto &a, const auto &b)
+                          { return a.alignDist < b.alignDist; });
+                v.resize(p.maxMatches);
+            }
+            alignAccumMs += (omp_get_wtime() - ta0) * 1e3;
+        };
+
+        // Flush the current batch (if any). Metadata is filled here so that
+        // even non-aligned survivors carry names/atom counts for CSV/report.
+        auto flushBatch = [&](bool finalFlush)
+        {
+            if (!wantPairs)
+            {
+                B.buf.clear();
+                return;
+            }
+            const uint64_t inN = B.buf.size();
+            if (inN == 0 && !finalFlush)
+                return;
+
+            if (p.traceProgress && (p.traceVerbose || finalFlush))
+            {
+                std::ostringstream os;
+                os << (finalFlush ? "final flush" : "flush")
+                   << " #" << (R.batches + 1) << " START  N=" << inN;
+                TR.force(os.str());
+            }
+
+            const double tf0 = omp_get_wtime();
+            if (inN)
+            {
+#pragma omp parallel for schedule(static) num_threads(nt)
+                for (long long k = 0; k < static_cast<long long>(B.buf.size()); ++k)
+                    fillMetadata(B.buf[static_cast<size_t>(k)]);
+
+                if (p.runAligner && p.pipelineAlign)
+                    alignBatch(B.buf);
+                // else: raw candidates kept; aligner runs in final pass
+
+                B.kept.insert(B.kept.end(),
+                              std::make_move_iterator(B.buf.begin()),
+                              std::make_move_iterator(B.buf.end()));
+                B.flushed += inN;
+                B.buf.clear();
+                ++R.batches;
+            }
+            materializeAccumMs += (omp_get_wtime() - tf0) * 1e3;
+
+            R.batchPairsFlushed = B.flushed;
+            R.peakBatchPairs = std::max<uint64_t>(R.peakBatchPairs, inN);
+            if (p.traceMemory)
+                R.peakRssBytes = std::max<size_t>(R.peakRssBytes,
+                                                  atomic_express_detail::currentRssBytes());
+            if (p.traceProgress && (p.traceVerbose || finalFlush || inN >= 100000))
+            {
+                std::ostringstream os;
+                os << (finalFlush ? "final flush" : "flush")
+                   << " #" << R.batches << " END  in=" << inN
+                   << " kept=" << B.kept.size()
+                   << " +" << std::fixed << std::setprecision(0)
+                   << (omp_get_wtime() - tf0) * 1e3 << "ms";
+                TR.force(os.str());
+            }
+        };
+
+        // Enqueue a batch of records; flush when the batch exceeds the budget.
+        auto enqueue = [&](std::vector<AtomicExpressResult::PairRecord> &&incoming)
+        {
+            if (incoming.empty())
+                return;
+            if (R.effectiveBatchPairs == 0)
+            {
+                // legacy: no batching, keep everything
+                if (p.runAligner && !p.pipelineAlign)
+                {
+                    B.all.insert(B.all.end(),
+                                 std::make_move_iterator(incoming.begin()),
+                                 std::make_move_iterator(incoming.end()));
+                }
+                else
+                {
+                    // no batching + no pipeline: materialise directly into kept
+                    if (!B.buf.empty())
+                    {
+#pragma omp parallel for schedule(static) num_threads(nt)
+                        for (long long k = 0; k < static_cast<long long>(B.buf.size()); ++k)
+                            fillMetadata(B.buf[static_cast<size_t>(k)]);
+                        B.kept.insert(B.kept.end(),
+                                      std::make_move_iterator(B.buf.begin()),
+                                      std::make_move_iterator(B.buf.end()));
+                        B.buf.clear();
+                    }
+                    B.buf.insert(B.buf.end(),
+                                 std::make_move_iterator(incoming.begin()),
+                                 std::make_move_iterator(incoming.end()));
+                }
+                return;
+            }
+
+            size_t pos = 0;
+            while (pos < incoming.size())
+            {
+                const size_t space = R.effectiveBatchPairs - B.buf.size();
+                const size_t take = std::min(space, incoming.size() - pos);
+                B.buf.insert(B.buf.end(),
+                             std::make_move_iterator(incoming.begin() + pos),
+                             std::make_move_iterator(incoming.begin() + pos + take));
+                pos += take;
+                if (B.buf.size() >= R.effectiveBatchPairs)
+                    flushBatch(false);
+            }
+        };
 
         // ---------------- tables g = 1..G ----------------
         for (int g = 1; g <= G; ++g)
@@ -371,7 +879,10 @@ public:
                 nE += cntE[c];
             }
             if (nE == 0 || nMem < 2)
+            {
+                TR.tick("table g=" + std::to_string(g) + "/" + std::to_string(G) + " skipped (empty)");
                 continue;
+            }
 
             entries.resize(nMem);
 #pragma omp parallel for schedule(static) num_threads(nt)
@@ -549,6 +1060,13 @@ public:
             if (top)
                 R.avgOccupancy = static_cast<double>(nMem) / static_cast<double>(C);
 
+            if (p.traceProgress)
+            {
+                std::ostringstream os;
+                os << "count g=" << g << "/" << G << " START  M=" << nMem << " cells=" << C;
+                TR.force(os.str());
+            }
+
             // ---- count phase ----
             const uint16_t *pLen = sLen.data();
             const uint16_t *pType = sType.data();
@@ -615,9 +1133,6 @@ public:
                         {
                             AtomicExpressResult::PairRecord rec;
 
-                            // Orient the pair by cloud index FIRST, then carry symbols/lengths
-                            // so that symbolA/lenA always describe clouds[rec.idxA] and
-                            // symbolB/lenB always describe clouds[rec.idxB].
                             uint32_t idLo = idA;
                             uint32_t idHi = pCloudId[q];
                             uint16_t symLo = ta;
@@ -671,13 +1186,28 @@ public:
                                        static_cast<uint32_t>(std::min(ne, s + CHUNK))});
             }
 
+            std::atomic<uint64_t> countTicks{0};
+            const uint64_t totalTicks = static_cast<uint64_t>(big.size() + C);
+
 #pragma omp parallel num_threads(nt)
             {
                 Local &L = locals[omp_get_thread_num()];
 #pragma omp for schedule(dynamic, 1) nowait
                 for (long long t = 0; t < static_cast<long long>(big.size()); ++t)
+                {
                     runChunk(big[static_cast<size_t>(t)].cell, big[static_cast<size_t>(t)].e0,
                              big[static_cast<size_t>(t)].e1, L);
+                    if (p.traceProgress)
+                    {
+                        const uint64_t c = ++countTicks;
+                        if ((c & 0xFFF) == 0)
+                        {
+                            std::ostringstream os;
+                            os << "count g=" << g << "/" << G;
+                            TR.progress(os.str(), c, totalTicks);
+                        }
+                    }
+                }
 #pragma omp for schedule(dynamic, 64)
                 for (long long c = 0; c < static_cast<long long>(C); ++c)
                 {
@@ -688,9 +1218,92 @@ public:
                 }
             }
             R.msCount += (omp_get_wtime() - tCells) * 1e3;
+
+            if (p.traceProgress)
+            {
+                std::ostringstream os;
+                os << "count g=" << g << "/" << G << " END  +"
+                   << std::fixed << std::setprecision(0)
+                   << (omp_get_wtime() - tCells) * 1e3 << "ms"
+                   << "  totalSoFar=" << R.total;
+                TR.force(os.str());
+            }
+
+            // ---- drain per-thread buffers into the batch pipeline ----
+            if (wantPairs)
+            {
+                std::vector<AtomicExpressResult::PairRecord> incoming;
+#pragma omp critical(express_batch_merge)
+                {
+                    size_t total = 0;
+                    for (auto &l : locals)
+                        total += l.pairs.size();
+                    incoming.reserve(total);
+                    for (auto &l : locals)
+                    {
+                        incoming.insert(incoming.end(),
+                                        std::make_move_iterator(l.pairs.begin()),
+                                        std::make_move_iterator(l.pairs.end()));
+                        l.pairs.clear();
+                    }
+                }
+                enqueue(std::move(incoming));
+            }
+
+            if (p.traceProgress && p.traceVerbose)
+            {
+                std::ostringstream os;
+                os << "table g=" << g << "/" << G
+                   << " cells=" << C
+                   << " maxOcc=" << maxOcc
+                   << " flushed=" << B.flushed
+                   << " kept=" << B.kept.size();
+                TR.line(os.str());
+            }
         }
 
-        // ---------------- reduce ----------------
+        // ---------------- final flush + assemble ----------------
+        if (wantPairs)
+        {
+            if (B.buf.size() > 0)
+                flushBatch(true);
+
+            // Legacy path: no batching but aligner deferred to end -> B.all holds
+            // all candidates. Align them once.
+            if (R.effectiveBatchPairs == 0 && p.runAligner && !p.pipelineAlign && !B.all.empty())
+            {
+                TR.force("align (deferred, all candidates) START  N=" + std::to_string(B.all.size()));
+#pragma omp parallel for schedule(static) num_threads(nt)
+                for (long long k = 0; k < static_cast<long long>(B.all.size()); ++k)
+                    fillMetadata(B.all[static_cast<size_t>(k)]);
+                alignBatch(B.all);
+                B.kept.insert(B.kept.end(),
+                              std::make_move_iterator(B.all.begin()),
+                              std::make_move_iterator(B.all.end()));
+                B.all.clear();
+            }
+
+            R.pairs = std::move(B.kept);
+            B.kept.clear();
+
+            // final ordering
+            if (p.runAligner)
+            {
+                std::sort(R.pairs.begin(), R.pairs.end(),
+                          [](const auto &a, const auto &b)
+                          { return a.alignDist < b.alignDist; });
+                if (p.topKGlobal && p.maxMatches > 0 && R.pairs.size() > p.maxMatches)
+                    R.pairs.resize(p.maxMatches);
+            }
+            else
+            {
+                std::sort(R.pairs.begin(), R.pairs.end(),
+                          [](const auto &a, const auto &b)
+                          { return a.srvDist < b.srvDist; });
+            }
+        }
+
+        // ---------------- reduce counts ----------------
         R.pairCount.assign(T * T, 0);
         for (const auto &l : locals)
         {
@@ -701,215 +1314,18 @@ public:
         for (uint64_t v : R.pairCount)
             R.total += v;
 
-        // ---------------- materialise pairs (metadata + optional aligner) ----------------
-        if (wantPairs)
-        {
-            size_t totalPairs = 0;
-            for (auto &l : locals)
-                totalPairs += l.pairs.size();
-            R.pairs.reserve(totalPairs);
-            for (auto &l : locals)
-            {
-                R.pairs.insert(R.pairs.end(),
-                               std::make_move_iterator(l.pairs.begin()),
-                               std::make_move_iterator(l.pairs.end()));
-                std::vector<AtomicExpressResult::PairRecord>().swap(l.pairs);
-            }
+        if (p.traceMemory)
+            R.peakRssBytes = std::max<size_t>(R.peakRssBytes,
+                                              atomic_express_detail::currentRssBytes());
 
-            // fill per-cloud metadata (names / counts / indices)
-#pragma omp parallel for schedule(static) num_threads(nt)
-            for (long long k = 0; k < static_cast<long long>(R.pairs.size()); ++k)
-            {
-                auto &rec = R.pairs[static_cast<size_t>(k)];
-                const auto &A = clouds[rec.idxA];
-                const auto &B = clouds[rec.idxB];
-                if (p.csvIncludeCloudNames)
-                {
-                    rec.nameA = A.name;
-                    rec.nameB = B.name;
-                }
-                if (p.csvIncludeAtomCounts)
-                {
-                    rec.atomsInA = A.numAtoms;
-                    rec.atomsInB = B.numAtoms;
-                }
-                rec.molIdxA = A.parentMoleculeIdx;
-                rec.atomIdxA = A.atomIndex;
-                rec.molIdxB = B.parentMoleculeIdx;
-                rec.atomIdxB = B.atomIndex;
-            }
-
-            std::sort(R.pairs.begin(), R.pairs.end(),
-                      [](const auto &a, const auto &b)
-                      { return a.srvDist < b.srvDist; });
-
-            // ---- optional Stage-2 bidirectional aligner ----
-            if (p.runAligner && !R.pairs.empty())
-            {
-                const double tAlign0 = omp_get_wtime();
-                const float rAlign = p.alignFactor * p.epsilon * (1.0f + p.relTol) + 1e-6f;
-
-                const auto MAXN = AtomicBottleneckEvaluator::MAX_VERTICES;
-
-                auto evalDirected = [&](const auto &srcAc,
-                                        const std::vector<CloudAlignmentEvaluator::Point3F> &srcCloud,
-                                        const std::vector<std::string> &srcSyms,
-                                        const auto &dstAc,
-                                        const std::vector<CloudAlignmentEvaluator::Point3F> &dstCloud,
-                                        const std::vector<std::string> &dstSyms,
-                                        SubsetAlignmentResult &out,
-                                        float &outDist) -> bool
-                {
-                    size_t limitSrc = (p.N > 0) ? std::min(p.N, srcAc.sortedAtomIndices.size())
-                                                : srcAc.sortedAtomIndices.size();
-                    const auto &idxDst = dstAc.sortedAtomIndices;
-                    if (limitSrc == 0 || idxDst.empty())
-                        return false;
-                    if (idxDst.size() < limitSrc)
-                        limitSrc = idxDst.size();
-                    std::vector<size_t> idxSrc(srcAc.sortedAtomIndices.begin(),
-                                               srcAc.sortedAtomIndices.begin() + limitSrc);
-
-                    AlignmentOptions opt;
-                    opt.exact = p.optimal;
-                    opt.acceptDistance = p.optimal ? 0.0f : rAlign;
-                    opt.refineIterations = p.refineIterations;
-                    opt.requireSameSymbol = p.requireSameNeighborSpecies;
-                    if (p.requireSameNeighborSpecies)
-                    {
-                        opt.symbolsA = &srcSyms;
-                        opt.symbolsB = &dstSyms;
-                    }
-
-                    out = AtomicCloudAlignmentEvaluator::alignSubsetAndEvaluate(
-                        srcCloud, idxSrc, dstCloud, idxDst, opt);
-                    if (!out.success)
-                        return false;
-                    outDist = out.bestBottleneck;
-
-                    const size_t mSub = idxSrc.size();
-                    const size_t nSub = idxDst.size();
-                    if (p.optimal && mSub <= MAXN && nSub <= MAXN && outDist <= rAlign)
-                    {
-                        // exact injective bottleneck refinement
-                        const float *R = out.rotation;
-                        std::vector<float> cost(mSub * nSub, std::numeric_limits<float>::infinity());
-                        float lo = 0.0f, hi = 0.0f;
-                        for (size_t i = 0; i < mSub; ++i)
-                        {
-                            const auto &pA = srcCloud[idxSrc[i]];
-                            float ax = R[0] * pA.x + R[1] * pA.y + R[2] * pA.z;
-                            float ay = R[3] * pA.x + R[4] * pA.y + R[5] * pA.z;
-                            float az = R[6] * pA.x + R[7] * pA.y + R[8] * pA.z;
-                            float rowMin = std::numeric_limits<float>::infinity();
-                            float rowMax = 0.0f;
-                            for (size_t j = 0; j < nSub; ++j)
-                            {
-                                if (p.requireSameNeighborSpecies &&
-                                    srcSyms[idxSrc[i]] != dstSyms[idxDst[j]])
-                                    continue;
-                                const auto &pB = dstCloud[idxDst[j]];
-                                float dx = ax - pB.x, dy = ay - pB.y, dz = az - pB.z;
-                                float d = std::sqrt(dx * dx + dy * dy + dz * dz);
-                                cost[i * nSub + j] = d;
-                                if (d < rowMin)
-                                    rowMin = d;
-                                if (d > rowMax)
-                                    rowMax = d;
-                            }
-                            if (rowMin < std::numeric_limits<float>::infinity() && rowMin > lo)
-                                lo = rowMin;
-                            if (rowMax > hi)
-                                hi = rowMax;
-                        }
-                        if (lo <= hi && hi > 0.0f)
-                            outDist = AtomicBottleneckEvaluator::bottleneckInjective(
-                                cost.data(), mSub, nSub, lo, hi);
-                        out.bestBottleneck = outDist;
-                    }
-                    return true;
-                };
-
-#pragma omp parallel for schedule(dynamic, 1) num_threads(nt)
-                for (long long k = 0; k < static_cast<long long>(R.pairs.size()); ++k)
-                {
-                    auto &rec = R.pairs[static_cast<size_t>(k)];
-                    const auto &acA = clouds[rec.idxA];
-                    const auto &acB = clouds[rec.idxB];
-
-                    std::vector<CloudAlignmentEvaluator::Point3F> cloudA(acA.atoms.size()), cloudB(acB.atoms.size());
-                    std::vector<std::string> symsA, symsB;
-                    if (p.requireSameNeighborSpecies)
-                    {
-                        symsA.resize(acA.atoms.size());
-                        symsB.resize(acB.atoms.size());
-                    }
-                    for (size_t i = 0; i < acA.atoms.size(); ++i)
-                    {
-                        cloudA[i] = {(float)acA.atoms[i].x, (float)acA.atoms[i].y, (float)acA.atoms[i].z};
-                        if (p.requireSameNeighborSpecies)
-                            symsA[i] = acA.atoms[i].symbol;
-                    }
-                    for (size_t i = 0; i < acB.atoms.size(); ++i)
-                    {
-                        cloudB[i] = {(float)acB.atoms[i].x, (float)acB.atoms[i].y, (float)acB.atoms[i].z};
-                        if (p.requireSameNeighborSpecies)
-                            symsB[i] = acB.atoms[i].symbol;
-                    }
-
-                    SubsetAlignmentResult rAB, rBA;
-                    float dAB = std::numeric_limits<float>::infinity();
-                    float dBA = std::numeric_limits<float>::infinity();
-
-                    bool okAB = evalDirected(acA, cloudA, symsA, acB, cloudB, symsB, rAB, dAB);
-                    bool okBA = evalDirected(acB, cloudB, symsB, acA, cloudA, symsA, rBA, dBA);
-
-                    if (okAB && okBA)
-                    {
-                        const float maxDist = std::max(dAB, dBA);
-                        rec.alignDistAB = dAB;
-                        rec.alignDistBA = dBA;
-                        rec.alignDist = maxDist;
-                        if (dAB > dBA)
-                            rec.alignDir = "A->B";
-                        else if (dBA > dAB)
-                            rec.alignDir = "B->A";
-                        else
-                            rec.alignDir = "equal";
-
-                        // Mark as fully aligned (and persist the rotations) ONLY when
-                        // the bidirectional bottleneck is within the aligner threshold.
-                        // Unaligned pairs still carry distances for diagnostics, but
-                        // their alignAB/alignBA stay empty so downstream code (viz,
-                        // apply_atomic_align, etc.) skips them.
-                        if (maxDist <= rAlign)
-                        {
-                            rec.aligned = true;
-                            rec.alignAB = std::move(rAB);
-                            rec.alignBA = std::move(rBA);
-                        }
-                    }
-                }
-
-                R.msAlign = (omp_get_wtime() - tAlign0) * 1e3;
-
-                // ---- Always drop unaligned rows after the aligner ran (matches
-                //      AtomicClassifier::classifyAll semantics), then optionally
-                //      truncate to the top-K best aligned pairs. ----
-                R.pairs.erase(
-                    std::remove_if(R.pairs.begin(), R.pairs.end(),
-                                   [](const auto &r)
-                                   { return !r.aligned; }),
-                    R.pairs.end());
-                std::sort(R.pairs.begin(), R.pairs.end(),
-                          [](const auto &a, const auto &b)
-                          { return a.alignDist < b.alignDist; });
-                if (p.maxMatches > 0 && R.pairs.size() > p.maxMatches)
-                    R.pairs.resize(p.maxMatches);
-            }
-        }
-
+        // ---------------- timing finalize ----------------
+        R.msAlign = alignAccumMs;
+        R.msMaterialize = wantPairs ? materializeAccumMs : 0.0;
         R.msTotal = (omp_get_wtime() - tAll) * 1e3;
+        R.msWithoutCsv = R.msTotal; // CSV write is outside this method
+
+        TR.phase("done  total=" + std::to_string(R.total) +
+                 "  in " + std::to_string(R.msTotal) + "ms");
         return R;
     }
 
@@ -988,6 +1404,16 @@ public:
         return true;
     }
 
+    // Wall-clock wrapper around writeCsv() that also records elapsed ms.
+    // The write happens OUTSIDE countCrossLabelPairs(); msTotal never includes it.
+    static bool timedWriteCsv(const std::string &path, AtomicExpressResult &r)
+    {
+        const double t0 = omp_get_wtime();
+        const bool ok = writeCsv(path, r);
+        r.msCsvWrite = (omp_get_wtime() - t0) * 1e3;
+        return ok;
+    }
+
     // ----------------------------------------------------------------- report
     static void printReport(const AtomicExpressParams &p, const AtomicExpressResult &r)
     {
@@ -1026,10 +1452,34 @@ public:
                   << "  Candidate comparisons: " << r.comparisons << "\n"
                   << "  Time ms: index " << r.msIndex << " | sort " << r.msSort << " | cells+hash " << r.msCells
                   << " | count " << r.msCount;
+        if (r.msMaterialize > 0)
+            std::cout << " | materialize " << r.msMaterialize;
         if (r.msAlign > 0)
             std::cout << " | align " << r.msAlign;
-        std::cout << " | total " << r.msTotal << "\n"
-                  << "=======================================================\n";
+        std::cout << " | total " << r.msTotal << "\n";
+
+        // Explicit "analysis only, no CSV write" line.
+        std::cout << "  Time excluding CSV write: " << r.msWithoutCsv << " ms";
+        if (r.msCsvWrite > 0)
+            std::cout << "  | CSV write: " << r.msCsvWrite << " ms";
+        std::cout << "\n";
+
+        // ---- batching telemetry ----
+        if (r.effectiveBatchPairs > 0)
+        {
+            std::cout << "  Batching: " << r.batches << " flushes, peak "
+                      << r.peakBatchPairs << " pairs/flush, budget "
+                      << (r.batchBudgetBytes >> 20) << " MiB"
+                      << " (batch size " << r.effectiveBatchPairs << ")\n";
+            std::cout << "  Total pairs flushed through pipeline: " << r.batchPairsFlushed << "\n";
+        }
+        else
+        {
+            std::cout << "  Batching: disabled (all candidates materialised)\n";
+        }
+        if (r.peakRssBytes > 0)
+            std::cout << "  Peak RSS: " << (r.peakRssBytes >> 20) << " MiB\n";
+        std::cout << "=======================================================\n";
 
         if (!r.pairs.empty())
         {
@@ -1061,8 +1511,6 @@ public:
         }
         if (p.runAligner && !r.pairs.empty())
         {
-            // Tally accepted pairs by (symbolA, symbolB), reusing the same
-            // ordering convention as Stage-1: min label first.
             std::unordered_map<std::string, uint64_t> labelCounts;
             labelCounts.reserve(r.types.size() * r.types.size());
 
@@ -1074,7 +1522,7 @@ public:
             for (const auto &pr : r.pairs)
             {
                 if (!pr.aligned)
-                    continue; // defensive: post-filter R.pairs should already be aligned-only
+                    continue;
                 ++accepted;
 
                 const std::string &a = pr.symbolA;
@@ -1114,5 +1562,82 @@ public:
             }
         }
         std::cout << "=======================================================\n\n";
+    }
+
+private:
+    // Resolve batching parameters into a concrete effectiveBatchPairs + budget.
+    // Rules (documented in AtomicExpressParams):
+    //   * batchPairs > 0                 -> manual, use it
+    //   * batchBytes > 0 (and batchPairs==0)
+    //       -> batchPairs = batchBytes / ~sizeof(PairRecord)
+    //   * both 0 and autoTuneRam == true -> derive from free physical RAM
+    //       budget = clamp(free * 0.5, 32 MiB, totalRam/4)
+    //       batchPairs = clamp(budget / est, 50_000, 5_000_000)
+    //   * both 0 and autoTuneRam == false -> batching disabled (legacy)
+    static void resolveBatchSizing(const AtomicExpressParams &p,
+                                   AtomicExpressResult &R,
+                                   const atomic_express_detail::Trace &TR)
+    {
+        // Estimated bytes per PairRecord.  Rough: two std::strings (~64 B),
+        // two SubsetAlignmentResult (rotation 9 floats + a few size_t + bools,
+        // ~80 B each), plus scalar fields -> ~200-260 B.  Use 256 to be safe.
+        constexpr size_t kEstPairBytes = 256;
+
+        size_t budget = 0;
+        size_t pairs = 0;
+
+        if (p.batchPairs > 0)
+        {
+            pairs = p.batchPairs;
+            budget = pairs * kEstPairBytes;
+            TR.line("batch sizing: manual batchPairs=" + std::to_string(pairs));
+        }
+        else if (p.batchBytes > 0 && p.batchBytes != std::numeric_limits<size_t>::max())
+        {
+            budget = p.batchBytes;
+            pairs = std::max<size_t>(1, budget / kEstPairBytes);
+            TR.line("batch sizing: manual batchBytes=" + std::to_string(budget) +
+                    " -> " + std::to_string(pairs) + " pairs");
+        }
+        else if (p.autoTuneRam)
+        {
+            const size_t total = atomic_express_detail::totalRamBytes();
+            const size_t rss = atomic_express_detail::currentRssBytes();
+            size_t free_est = 0;
+            if (total > rss)
+                free_est = total - rss;
+
+            // Default: 50% of free, clamped to [32 MiB, total/4].
+            size_t b = free_est ? (free_est / 2) : (size_t(256) << 20);
+            const size_t lo = size_t(32) << 20;
+            const size_t hi = total ? std::max(lo, total / 4) : (size_t(1024) << 20);
+            if (b < lo)
+                b = lo;
+            if (b > hi)
+                b = hi;
+            budget = b;
+            pairs = std::max<size_t>(1, budget / kEstPairBytes);
+            // clamp pair count to sane range
+            constexpr size_t kMinPairs = 50'000;
+            constexpr size_t kMaxPairs = 5'000'000;
+            if (pairs < kMinPairs)
+                pairs = kMinPairs;
+            if (pairs > kMaxPairs)
+                pairs = kMaxPairs;
+            budget = pairs * kEstPairBytes;
+            TR.line("batch sizing: auto (" + std::to_string(total >> 20) + " MiB total, " +
+                    std::to_string(rss >> 20) + " MiB rss) -> budget " +
+                    std::to_string(budget >> 20) + " MiB, " + std::to_string(pairs) + " pairs");
+        }
+        else
+        {
+            // explicit disable
+            pairs = 0;
+            budget = 0;
+            TR.line("batch sizing: disabled (autoTuneRam=false, no explicit size)");
+        }
+
+        R.effectiveBatchPairs = pairs;
+        R.batchBudgetBytes = budget;
     }
 };

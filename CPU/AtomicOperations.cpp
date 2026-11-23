@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <omp.h>
 #include <oneapi/tbb/parallel_sort.h>
+#include <oneapi/tbb/parallel_for.h>
+#include <oneapi/tbb/enumerable_thread_specific.h>
 #include "Visualization/PolyscopeBridge.h"
 
 AtomicOperations::AtomicOperations(MolecularDatasetStore &store)
@@ -555,9 +557,15 @@ bool AtomicOperations::unviewAtomicIndex(size_t index) const
 AtomicExpressResult AtomicOperations::runAtomicExpressCount(const AtomicExpressParams& p,
                                                             bool verifyAgainstBruteForce)
 {
+    // =========================================================
+    //  END-TO-END WALL-CLOCK START
+    // =========================================================
+    const double tWallStart = omp_get_wtime();
+
     auto& atomicEntries = m_store.atomicClouds();
 
-    // --- lazy bootstrap ---
+    // ---------------- bootstrap (timed) ----------------
+    const double tBoot0 = omp_get_wtime();
     if (atomicEntries.empty())
     {
         std::cout << "[AtomicExpress] No atomic clouds present, generating them first...\n";
@@ -571,6 +579,7 @@ AtomicExpressResult AtomicOperations::runAtomicExpressCount(const AtomicExpressP
         std::cout << "[AtomicExpress] Descriptors missing, computing them first...\n";
         computeAtomicDescriptors();
     }
+    const double msBootstrap = (omp_get_wtime() - tBoot0) * 1e3;
 
     if (atomicEntries.size() < 2)
     {
@@ -578,7 +587,7 @@ AtomicExpressResult AtomicOperations::runAtomicExpressCount(const AtomicExpressP
         return {};
     }
 
-    // --- banner ---
+    // ---------------- banner ----------------
     const float rSrv   = p.srvFactor   * p.epsilon * (1.0f + p.relTol) + 1e-6f;
     const float rAlign = p.alignFactor * p.epsilon * (1.0f + p.relTol) + 1e-6f;
 
@@ -609,82 +618,235 @@ AtomicExpressResult AtomicOperations::runAtomicExpressCount(const AtomicExpressP
                   << "x (limit: " << rAlign << " A)\n"
                   << "  Species Constraint  : " << (p.requireSameNeighborSpecies ? "true" : "false") << "\n"
                   << "  Kabsch Refinement   : " << p.refineIterations << " rounds\n"
-                  << "  Max Matches Stored  : " << (p.maxMatches == 0 ? "ALL" : std::to_string(p.maxMatches)) << "\n";
+                  << "  Max Matches Stored  : " << (p.maxMatches == 0 ? "ALL" : std::to_string(p.maxMatches)) << "\n"
+                  << "  Store Viz (viz)     : " << (p.storeViz ? "on" : "off") << "\n";
     }
-    std::cout << "  Verify vs O(M^2)    : " << (verifyAgainstBruteForce ? "true" : "false") << "\n"
+    std::cout << "-------------------------------------------------------\n"
+              << "  Batching            : ";
+    if (p.batchPairs > 0)
+        std::cout << "manual, " << p.batchPairs << " pairs/batch\n";
+    else if (p.batchBytes > 0 && p.batchBytes != std::numeric_limits<size_t>::max())
+        std::cout << "manual, " << (p.batchBytes >> 20) << " MiB/batch\n";
+    else if (p.autoTuneRam)
+        std::cout << "auto (sized from free RAM)\n";
+    else
+        std::cout << "disabled (materialise all)\n";
+    std::cout << "  Pipeline Aligner    : " << (p.pipelineAlign ? "on (per-batch)" : "off (deferred)") << "\n"
+              << "  Top-K Scope         : " << (p.topKGlobal ? "global" : "per-batch") << "\n"
+              << "  Trace Progress      : " << (p.traceProgress ? "on" : "off") << "\n"
+              << "  Trace Memory (RSS)  : " << (p.traceMemory ? "on" : "off") << "\n"
+              << "  Trace Verbose       : " << (p.traceVerbose ? "on" : "off") << "\n"
+              << "  Trace Interval      : " << std::fixed << std::setprecision(2)
+              << p.traceIntervalSec << " s\n"
+              << "  Verify vs O(M^2)    : " << (verifyAgainstBruteForce ? "true" : "false") << "\n"
               << "=======================================================\n\n"
               << std::flush;
 
-    // --- run express ---
+    // ---------------- CORE (timed inside countCrossLabelPairs) ----------------
     AtomicClassifierExpress express;
     AtomicExpressResult R = express.countCrossLabelPairs(atomicEntries, p);
+
+    // ---------------- report (timed) ----------------
+    const double tRep0 = omp_get_wtime();
     AtomicClassifierExpress::printReport(p, R);
+    const double msReport = (omp_get_wtime() - tRep0) * 1e3;
 
-    // --- push aligned pairs into the visualizer (both directions) ---
-    // Mirrors runBatchAtomicClassify: only aligned pairs, two calls per pair.
-    if (p.runAligner && !R.pairs.empty())
+    // ---------------- viz store (parallel build, O(1) serial merge, timed) ----------------
+    double msViz = 0.0;
+    if (p.runAligner && p.storeViz && !R.pairs.empty())
     {
-        size_t stored = 0;
-        for (const auto& rec : R.pairs)
+        const double tViz0 = omp_get_wtime();
+
+#if defined(ATOMIC_EXPRESS_HAVE_TBB) || __has_include(<oneapi/tbb/parallel_for.h>)
         {
-            if (!rec.aligned) continue;
-            const auto& acA = atomicEntries[rec.idxA];
-            const auto& acB = atomicEntries[rec.idxB];
+            oneapi::tbb::enumerable_thread_specific<
+                std::vector<AtomicMatchingViz::AtomicMatchRecord>> ets;
 
-            // ---- A -> B ----
-            size_t limitA = (p.N > 0)
-                                ? std::min(p.N, acA.sortedAtomIndices.size())
-                                : acA.sortedAtomIndices.size();
-            if (acB.sortedAtomIndices.size() < limitA)
-                limitA = acB.sortedAtomIndices.size();
-            std::vector<size_t> idxA_subset(acA.sortedAtomIndices.begin(),
-                                            acA.sortedAtomIndices.begin() + limitA);
+            oneapi::tbb::parallel_for(
+                oneapi::tbb::blocked_range<size_t>(0, R.pairs.size(), size_t(512)),
+                [&](const oneapi::tbb::blocked_range<size_t>& range)
+                {
+                    auto& local = ets.local();
+                    local.reserve(local.size() + 2 * (range.end() - range.begin()));
 
-            AtomicMatchingViz::store(
-                rec.idxA, rec.idxB,
-                acA.parentMoleculeIdx, acA.symbol, acA.atomIndex,
-                acB.parentMoleculeIdx, acB.symbol, acB.atomIndex,
-                rec.alignAB, idxA_subset, acB.sortedAtomIndices);
+                    for (size_t k = range.begin(); k < range.end(); ++k)
+                    {
+                        const auto& rec = R.pairs[k];
+                        if (!rec.aligned) continue;
+                        const auto& acA = atomicEntries[rec.idxA];
+                        const auto& acB = atomicEntries[rec.idxB];
 
-            // ---- B -> A ----
-            size_t limitB = (p.N > 0)
-                                ? std::min(p.N, acB.sortedAtomIndices.size())
-                                : acB.sortedAtomIndices.size();
-            if (acA.sortedAtomIndices.size() < limitB)
-                limitB = acA.sortedAtomIndices.size();
-            std::vector<size_t> idxB_subset(acB.sortedAtomIndices.begin(),
-                                            acB.sortedAtomIndices.begin() + limitB);
+                        // ---- A -> B ----
+                        size_t limitA = (p.N > 0)
+                                            ? std::min<size_t>(p.N, acA.sortedAtomIndices.size())
+                                            : acA.sortedAtomIndices.size();
+                        if (acB.sortedAtomIndices.size() < limitA)
+                            limitA = acB.sortedAtomIndices.size();
+                        std::vector<size_t> idxA_subset(acA.sortedAtomIndices.begin(),
+                                                        acA.sortedAtomIndices.begin() + limitA);
 
-            AtomicMatchingViz::store(
-                rec.idxB, rec.idxA,
-                acB.parentMoleculeIdx, acB.symbol, acB.atomIndex,
-                acA.parentMoleculeIdx, acA.symbol, acA.atomIndex,
-                rec.alignBA, idxB_subset, acA.sortedAtomIndices);
+                        AtomicMatchingViz::AtomicMatchRecord mA;
+                        mA.idA = rec.idxA;
+                        mA.idB = rec.idxB;
+                        mA.nameA = AtomicMatchingViz::atomicCloudName(
+                            rec.idxA, acA.parentMoleculeIdx, acA.symbol, acA.atomIndex);
+                        mA.nameB = AtomicMatchingViz::atomicCloudName(
+                            rec.idxB, acB.parentMoleculeIdx, acB.symbol, acB.atomIndex);
+                        mA.matching       = rec.alignAB.matching;
+                        mA.subsetIndicesA = idxA_subset;
+                        mA.subsetIndicesB = acB.sortedAtomIndices;
+                        mA.bottleneck     = rec.alignAB.bestBottleneck;
+                        for (int i = 0; i < 9; ++i) mA.R[i] = rec.alignAB.rotation[i];
+                        mA.visible = false;
+                        local.push_back(std::move(mA));
 
-            ++stored;
+                        // ---- B -> A ----
+                        size_t limitB = (p.N > 0)
+                                            ? std::min<size_t>(p.N, acB.sortedAtomIndices.size())
+                                            : acB.sortedAtomIndices.size();
+                        if (acA.sortedAtomIndices.size() < limitB)
+                            limitB = acA.sortedAtomIndices.size();
+                        std::vector<size_t> idxB_subset(acB.sortedAtomIndices.begin(),
+                                                        acB.sortedAtomIndices.begin() + limitB);
+
+                        AtomicMatchingViz::AtomicMatchRecord mB;
+                        mB.idA = rec.idxB;
+                        mB.idB = rec.idxA;
+                        mB.nameA = AtomicMatchingViz::atomicCloudName(
+                            rec.idxB, acB.parentMoleculeIdx, acB.symbol, acB.atomIndex);
+                        mB.nameB = AtomicMatchingViz::atomicCloudName(
+                            rec.idxA, acA.parentMoleculeIdx, acA.symbol, acA.atomIndex);
+                        mB.matching       = rec.alignBA.matching;
+                        mB.subsetIndicesA = idxB_subset;
+                        mB.subsetIndicesB = acA.sortedAtomIndices;
+                        mB.bottleneck     = rec.alignBA.bestBottleneck;
+                        for (int i = 0; i < 9; ++i) mB.R[i] = rec.alignBA.rotation[i];
+                        mB.visible = false;
+                        local.push_back(std::move(mB));
+                    }
+                });
+
+            // ---- O(1)-average serial merge using s_matchIndex ----
+            if (AtomicMatchingViz::s_matchIndex.size() != AtomicMatchingViz::s_atomicMatches.size())
+            {
+                AtomicMatchingViz::rebuildIndex();
+            }
+
+            size_t total = 0;
+            for (const auto& buf : ets) total += buf.size();
+            AtomicMatchingViz::s_atomicMatches.reserve(
+                AtomicMatchingViz::s_atomicMatches.size() + total);
+            AtomicMatchingViz::s_matchIndex.reserve(
+                AtomicMatchingViz::s_atomicMatches.size() + total);
+
+            size_t stored = 0;
+            for (auto& buf : ets)
+            {
+                for (auto& m : buf)
+                {
+                    const uint64_t key = AtomicMatchingViz::makePairKey(m.idA, m.idB);
+                    auto it = AtomicMatchingViz::s_matchIndex.find(key);
+                    if (it != AtomicMatchingViz::s_matchIndex.end() &&
+                        it->second < AtomicMatchingViz::s_atomicMatches.size() &&
+                        AtomicMatchingViz::s_atomicMatches[it->second].idA == m.idA &&
+                        AtomicMatchingViz::s_atomicMatches[it->second].idB == m.idB)
+                    {
+                        AtomicMatchingViz::s_atomicMatches[it->second] = std::move(m);
+                    }
+                    else
+                    {
+                        const size_t newIdx = AtomicMatchingViz::s_atomicMatches.size();
+                        AtomicMatchingViz::s_atomicMatches.push_back(std::move(m));
+                        AtomicMatchingViz::s_matchIndex[key] = newIdx;
+                    }
+                    ++stored;
+                }
+            }
+
+            msViz = (omp_get_wtime() - tViz0) * 1e3;
+            std::cout << "[AtomicExpress] Stored " << stored
+                      << " aligned records (" << R.pairs.size() << " pairs x 2 dirs) "
+                      << "via TBB build + serial merge in "
+                      << std::fixed << std::setprecision(2) << msViz << " ms\n";
         }
-        std::cout << "[AtomicExpress] Stored " << stored
-                  << " aligned pairs in AtomicMatchingViz (both directions).\n";
+#else
+        {
+            // ---- no-TBB fallback: serial loop using fast AtomicMatchingViz::store ----
+            size_t stored = 0;
+            for (const auto& rec : R.pairs)
+            {
+                if (!rec.aligned) continue;
+                const auto& acA = atomicEntries[rec.idxA];
+                const auto& acB = atomicEntries[rec.idxB];
+
+                size_t limitA = (p.N > 0)
+                                    ? std::min<size_t>(p.N, acA.sortedAtomIndices.size())
+                                    : acA.sortedAtomIndices.size();
+                if (acB.sortedAtomIndices.size() < limitA)
+                    limitA = acB.sortedAtomIndices.size();
+                std::vector<size_t> idxA_subset(acA.sortedAtomIndices.begin(),
+                                                acA.sortedAtomIndices.begin() + limitA);
+
+                AtomicMatchingViz::store(
+                    rec.idxA, rec.idxB,
+                    acA.parentMoleculeIdx, acA.symbol, acA.atomIndex,
+                    acB.parentMoleculeIdx, acB.symbol, acB.atomIndex,
+                    rec.alignAB, idxA_subset, acB.sortedAtomIndices);
+
+                size_t limitB = (p.N > 0)
+                                    ? std::min<size_t>(p.N, acB.sortedAtomIndices.size())
+                                    : acB.sortedAtomIndices.size();
+                if (acA.sortedAtomIndices.size() < limitB)
+                    limitB = acA.sortedAtomIndices.size();
+                std::vector<size_t> idxB_subset(acB.sortedAtomIndices.begin(),
+                                                acB.sortedAtomIndices.begin() + limitB);
+
+                AtomicMatchingViz::store(
+                    rec.idxB, rec.idxA,
+                    acB.parentMoleculeIdx, acB.symbol, acB.atomIndex,
+                    acA.parentMoleculeIdx, acA.symbol, acA.atomIndex,
+                    rec.alignBA, idxB_subset, acA.sortedAtomIndices);
+
+                ++stored;
+            }
+            msViz = (omp_get_wtime() - tViz0) * 1e3;
+            std::cout << "[AtomicExpress] Stored " << stored
+                      << " aligned pairs in AtomicMatchingViz (both directions) in "
+                      << std::fixed << std::setprecision(2) << msViz << " ms\n";
+        }
+#endif
+    }
+    else if (p.runAligner && !p.storeViz && !R.pairs.empty())
+    {
+        std::cout << "[AtomicExpress] Skipped AtomicMatchingViz store (storeViz=off). "
+                  << R.pairs.size() << " aligned pairs are still in R.pairs for CSV/report.\n";
     }
 
-    // --- optional CSV ---
+    // ---------------- CSV (timed) ----------------
+    double msCsv = 0.0;
     if (!p.csvPath.empty())
-        AtomicClassifierExpress::writeCsv(p.csvPath, R);
+    {
+        const double tCsv0 = omp_get_wtime();
+        AtomicClassifierExpress::timedWriteCsv(p.csvPath, R);
+        msCsv = (omp_get_wtime() - tCsv0) * 1e3;
+        std::cout << "[AtomicExpress] CSV write took "
+                  << std::fixed << std::setprecision(2) << msCsv << " ms\n";
+    }
 
-    // --- optional correctness oracle ---
+    // ---------------- verify (timed) ----------------
+    double msVerify = 0.0;
     if (verifyAgainstBruteForce)
     {
+        const double tVer0 = omp_get_wtime();
         std::cout << "[AtomicExpress] Running O(M^2) brute-force oracle for verification...\n";
-        auto t0 = std::chrono::high_resolution_clock::now();
         AtomicExpressResult B = AtomicClassifierExpress::countBruteForce(atomicEntries, p);
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double oracleMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
         bool ok = (R.total == B.total) && (R.pairCount.size() == B.pairCount.size());
         if (ok)
             for (size_t i = 0; i < R.pairCount.size(); ++i)
                 if (R.pairCount[i] != B.pairCount[i]) { ok = false; break; }
 
+        msVerify = (omp_get_wtime() - tVer0) * 1e3;
         std::cout << "-------------------------------------------------------\n";
         if (ok)
             std::cout << "  [VERIFY] OK   : express == brute force  (total = " << R.total << ")\n";
@@ -692,9 +854,39 @@ AtomicExpressResult AtomicOperations::runAtomicExpressCount(const AtomicExpressP
             std::cout << "  [VERIFY] FAIL : express total = " << R.total
                       << " , brute total = " << B.total << "\n";
         std::cout << "  [VERIFY] brute-force time: " << std::fixed << std::setprecision(2)
-                  << oracleMs << " ms\n"
+                  << msVerify << " ms\n"
                   << "-------------------------------------------------------\n";
     }
+
+    // =========================================================
+    //  END-TO-END WALL-CLOCK REPORT
+    // =========================================================
+    const double msWall = (omp_get_wtime() - tWallStart) * 1e3;
+
+    std::cout << "\n=======================================================\n"
+              << "  END-TO-END TIMING BREAKDOWN\n"
+              << "=======================================================\n"
+              << std::fixed << std::setprecision(2)
+              << "  Bootstrap (gen + descriptors)  : " << msBootstrap << " ms\n"
+              << "  countCrossLabelPairs (core)    : " << R.msTotal << " ms\n"
+              << "    -> index (compact + grid)    : " << R.msIndex << " ms\n"
+              << "    -> grid sort                 : " << R.msSort << " ms\n"
+              << "    -> cells + hash              : " << R.msCells << " ms\n"
+              << "    -> count (exact SRV test)    : " << R.msCount << " ms\n"
+              << "    -> materialize (finalize)    : " << R.msMaterialize << " ms\n"
+              << "    ->   of which aligner        : " << R.msAlign << " ms\n"
+              << "  printReport                    : " << msReport << " ms\n"
+              << "  AtomicMatchingViz::store       : " << msViz << " ms\n"
+              << "  CSV write                      : " << msCsv << " ms\n";
+    if (verifyAgainstBruteForce)
+        std::cout << "  Brute-force oracle             : " << msVerify << " ms\n";
+    std::cout << "  -----------------------------------------------------\n"
+              << "  TOTAL WALL CLOCK               : " << msWall << " ms"
+              << "  (" << std::setprecision(3) << (msWall / 1000.0) << " s)\n"
+              << "  Peak RSS                       : "
+              << (R.peakRssBytes > 0 ? (std::to_string(R.peakRssBytes >> 20) + " MiB") : "(not tracked)")
+              << "\n"
+              << "=======================================================\n\n";
 
     return R;
 }

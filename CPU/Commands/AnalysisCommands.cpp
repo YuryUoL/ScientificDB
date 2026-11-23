@@ -502,43 +502,263 @@ namespace Commands
                            });
 
         ui.registerCommand(
-            "atomic_classify", "[all] [epsilon|csv_file] [N=val] [key=val ...]",
-            "Runs batch classification across all atomic neighborhood clouds.",
+            "atomic_express", "[epsilon] [N=val] [key=val ...] [verify] [trace] [quiet]",
+            "Fast Stage-1-only SRV pair counter (optional CSV export + Stage-2 aligner). "
+            "Prints per-label duplicate counts (C-O, C-N, ...). Supports batched pipelining, "
+            "RAM tracking, and progress tracing.",
             [atomOps](std::istringstream &iss)
             {
-                std::string csvPath = "atomic_matches.csv";
-                AtomicClassifyParams p;
+                AtomicExpressParams p;
+                bool verify = false;
                 std::string token;
 
-                while (iss >> token)
+                auto toBool = [](const std::string &v)
                 {
-                    if (token == "all")
-                        continue;
+                    return v == "1" || v == "true" || v == "on" || v == "yes" ||
+                           v == "TRUE" || v == "True" || v == "ON";
+                };
 
-                    size_t eq = token.find('=');
+                // convenience flags (no key= form)
+                for (std::string tok; iss >> tok;)
+                {
+                    if (tok == "verify" || tok == "check" || tok == "oracle")
+                    {
+                        verify = true;
+                        continue;
+                    }
+                    if (tok == "trace" || tok == "progress" || tok == "verbose")
+                    {
+                        p.traceProgress = true;
+                        p.traceMemory = true;
+                        p.traceVerbose = true;
+                        continue;
+                    }
+                    if (tok == "trace-lite" || tok == "traceLite")
+                    {
+                        p.traceProgress = true;
+                        continue;
+                    }
+                    if (tok == "quiet" || tok == "silent")
+                    {
+                        p.traceProgress = false;
+                        p.traceMemory = false;
+                        p.traceVerbose = false;
+                        continue;
+                    }
+                    if (tok == "noviz" || tok == "no-viz" || tok == "nostore")
+                    {
+                        p.storeViz = false;
+                        continue;
+                    }
+
+                    const size_t eq = tok.find('=');
                     if (eq != std::string::npos)
                     {
-                        std::string key = token.substr(0, eq);
-                        std::string val = token.substr(eq + 1);
+                        const std::string key = tok.substr(0, eq);
+                        const std::string val = tok.substr(eq + 1);
 
-                        if (key == "csv" || key == "out" || key == "file")
+                        // ---- Stage-1 core ----
+                        if (key == "N" || key == "n")
                         {
-                            csvPath = val;
+                            try
+                            {
+                                p.N = std::stoul(val);
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                        else if (key == "eps" || key == "epsilon")
+                        {
+                            try
+                            {
+                                p.epsilon = std::stof(val);
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                        else if (key == "same")
+                        {
+                            p.considerSame = toBool(val);
+                        }
+                        else if (key == "srvf")
+                        {
+                            try
+                            {
+                                p.srvFactor = std::stof(val);
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                        else if (key == "tol")
+                        {
+                            try
+                            {
+                                p.relTol = std::stof(val);
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                        else if (key == "grid")
+                        {
+                            try
+                            {
+                                p.gridDim = std::stoi(val);
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                        else if (key == "threads")
+                        {
+                            try
+                            {
+                                p.numThreads = std::stoi(val);
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                        else if (key == "parallel")
+                        {
+                            p.parallel = toBool(val);
+                        }
+                        // ---- CSV export ----
+                        else if (key == "csv" || key == "out" || key == "file")
+                        {
+                            p.csvPath = val;
+                        }
+                        else if (key == "names")
+                        {
+                            p.csvIncludeCloudNames = toBool(val);
+                        }
+                        else if (key == "counts")
+                        {
+                            p.csvIncludeAtomCounts = toBool(val);
+                        }
+                        // ---- Batching ----
+                        else if (key == "batch" || key == "batchpairs" || key == "bp")
+                        {
+                            try
+                            {
+                                p.batchPairs = std::stoull(val);
+                            }
+                            catch (...)
+                            {
+                            }
+                            if (p.batchPairs == 0)
+                                p.autoTuneRam = false; // explicit 0 = disable
+                        }
+                        else if (key == "batchbytes" || key == "bb")
+                        {
+                            try
+                            {
+                                p.batchBytes = std::stoull(val);
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                        else if (key == "auto" || key == "autotune" || key == "autoram")
+                        {
+                            p.autoTuneRam = toBool(val);
+                        }
+                        else if (key == "pipe" || key == "pipeline")
+                        {
+                            p.pipelineAlign = toBool(val);
+                        }
+                        else if (key == "topk" || key == "topkglobal")
+                        {
+                            p.topKGlobal = toBool(val);
+                        }
+                        // ---- Progress tracing ----
+                        else if (key == "trace" || key == "progress")
+                        {
+                            p.traceProgress = toBool(val);
+                        }
+                        else if (key == "mem" || key == "rss")
+                        {
+                            p.traceMemory = toBool(val);
+                        }
+                        else if (key == "verbose" || key == "vtrace")
+                        {
+                            p.traceVerbose = toBool(val);
+                        }
+                        else if (key == "interval" || key == "dt")
+                        {
+                            try
+                            {
+                                p.traceIntervalSec = std::stod(val);
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                        // ---- Stage-2 aligner ----
+                        else if (key == "align" || key == "aligner" || key == "stage2")
+                        {
+                            p.runAligner = toBool(val);
+                        }
+                        else if (key == "optimal" || key == "opt" || key == "exact")
+                        {
+                            p.optimal = toBool(val);
+                        }
+                        else if (key == "alignf")
+                        {
+                            try
+                            {
+                                p.alignFactor = std::stof(val);
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                        else if (key == "species")
+                        {
+                            p.requireSameNeighborSpecies = toBool(val);
+                        }
+                        else if (key == "refine")
+                        {
+                            try
+                            {
+                                p.refineIterations = std::stoi(val);
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                        else if (key == "max")
+                        {
+                            try
+                            {
+                                p.maxMatches = std::stoul(val);
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                        else if (key == "store" || key == "viz" || key == "storeviz")
+                        {
+                            p.storeViz = toBool(val);
                         }
                         else
                         {
-                            p.set(key, val);
+                            std::cout << "[AtomicExpress] Unknown key '" << key << "', ignored.\n";
                         }
                     }
-                    else if (token.find(".csv") != std::string::npos)
+                    else if (tok.find(".csv") != std::string::npos)
                     {
-                        csvPath = token;
+                        p.csvPath = tok;
                     }
                     else
                     {
+                        // bare number -> epsilon
                         try
                         {
-                            p.epsilon = std::stof(token);
+                            p.epsilon = std::stof(tok);
                         }
                         catch (...)
                         {
@@ -546,207 +766,76 @@ namespace Commands
                     }
                 }
 
-                std::cout << "\n=======================================================\n"
-                          << "  LAUNCHING ATOMIC BATCH CLASSIFICATION\n"
-                          << "=======================================================\n"
-                          << "  CSV Export Path     : " << (csvPath.empty() ? "(none / disabled)" : csvPath) << "\n"
-                          << "  Epsilon (epsilon)   : " << std::fixed << std::setprecision(4) << p.epsilon << " A\n"
-                          << "  Neighbors (N)       : " << (p.N == 0 ? "ALL neighbors" : std::to_string(p.N)) << "\n"
-                          << "  Consider Same Type  : " << (p.considerSame ? "true (all pairs)" : "false (different center types only)") << "\n"
-                          << "  Optimal Aligner     : " << (p.optimal ? "true (exact bottleneck)" : "false (fast early-exit <= eps)") << "\n"
-                          << "  Species Constraint  : " << (p.requireSameNeighborSpecies ? "true (elements must match)" : "false") << "\n"
-                          << "  Kabsch Refinement   : " << p.refineIterations << " rounds\n"
-                          << "  SRV Factor (srvf)   : " << std::fixed << std::setprecision(2) << p.srvFactor << "x (limit: " << (p.srvFactor * p.epsilon) << " A)\n"
-                          << "  Align Factor (alignf: " << std::fixed << std::setprecision(2) << p.alignFactor << "x (limit: " << (p.alignFactor * p.epsilon) << " A)\n"
-                          << "  Slack Tol (tol)     : " << p.relTol << "\n"
-                          << "  Max Matches Stored  : " << (p.maxMatches == 0 ? "ALL" : std::to_string(p.maxMatches)) << "\n"
-                          << "  Execution Mode      : " << (p.parallel ? "Parallel (OpenMP)" : "Single-threaded")
-                          << " (threads: " << (p.numThreads > 0 ? std::to_string(p.numThreads) : "auto/max") << ")\n"
-                          << "=======================================================\n\n"
-                          << std::flush;
+                // Guardrails
+                if (p.maxMatches > 0 && !p.runAligner)
+                {
+                    std::cout << "[AtomicExpress] Note: 'max=' requires 'align=1'; ignoring maxMatches.\n";
+                    p.maxMatches = 0;
+                }
+                if (!p.runAligner)
+                    p.pipelineAlign = false; // no-op but makes banner honest
+                if (p.batchPairs == 0 && p.batchBytes == 0 && !p.autoTuneRam)
+                {
+                    std::cout << "[AtomicExpress] Note: batching disabled — this materialises ALL "
+                                 "Stage-1 survivors in RAM. Use batch=N or auto=1 to bound memory.\n";
+                }
 
-                AtomicClassifyStats st;
-                auto matches = atomOps->runBatchAtomicClassify(csvPath, p, st);
-                AtomicClassifier::printBatchReport(p, st, matches, csvPath);
+                atomOps->runAtomicExpressCount(p, verify);
             },
-            "  Parameters & Runtime Options:\n"
-            "    epsilon        : Max bottleneck distance threshold in Angstroms (default: 0.10)\n"
-            "    N=<int>        : Number of nearest non-center neighbor atoms to compare (default: 4)\n"
-            "    same=<0/1>     : 1 = compare all pairs; 0 = only compare different center types (default: 0)\n"
-            "    optimal=<0/1>  : 1 = exact minimum bottleneck; 0 = fast early-exit aligner (default: 0)\n"
-            "    species=<0/1>  : Require matched neighbor atoms to have identical element symbols (default: 0)\n"
-            "    refine=<int>   : Kabsch alignment refinement rounds (default: 0)\n"
-            "    srvf=<float>   : Stage 1 SRV L_inf radius multiplier factor (default: 1.0)\n"
-            "    alignf=<float> : Stage 2 Aligner bottleneck multiplier factor (default: 1.0)\n"
-            "    tol=<float>    : Floating-point noise slack tolerance (default: 1e-4)\n"
-            "    max=<int>      : Keep only top K best matches, 0 = all (default: 0)\n"
-            "    threads=<int>  : OpenMP thread count override, 0 = max available (default: 0)\n"
-            "    parallel=<0/1> : Enable/disable multi-threaded candidate evaluation (default: 1)\n\n"
-            "  Runtime Usage Examples:\n"
-            "    atomic_classify 0.10 N=4\n"
-            "    atomic_classify 0.08 my_custom_output.csv N=6 same=1 species=1 refine=2\n"
-            "    atomic_classify all 0.05 csv=results.csv optimal=1 max=50 parallel=1");
-
-        ui.registerAlias("atomicClassify", "atomic_classify");
-        ui.registerAlias("classify_atoms", "atomic_classify");
-        ui.registerAlias("classifyAtoms", "atomic_classify");
-
-        ui.registerCommand(
-    "atomic_express", "[epsilon] [N=val] [key=val ...] [verify]",
-    "Fast Stage-1-only SRV pair counter (optional CSV export + Stage-2 aligner). "
-    "Prints per-label duplicate counts (C-O, C-N, ...).",
-    [atomOps](std::istringstream &iss)
-    {
-        AtomicExpressParams p;
-        bool verify = false;
-        std::string token;
-
-        while (iss >> token)
-        {
-            if (token == "verify" || token == "check" || token == "oracle")
-            {
-                verify = true;
-                continue;
-            }
-
-            const size_t eq = token.find('=');
-            if (eq != std::string::npos)
-            {
-                const std::string key = token.substr(0, eq);
-                const std::string val = token.substr(eq + 1);
-
-                auto toBool = [](const std::string &v) {
-                    return v == "1" || v == "true" || v == "on" || v == "yes";
-                };
-
-                if (key == "N" || key == "n")
-                {
-                    try { p.N = std::stoul(val); } catch (...) {}
-                }
-                else if (key == "eps" || key == "epsilon")
-                {
-                    try { p.epsilon = std::stof(val); } catch (...) {}
-                }
-                else if (key == "same")
-                {
-                    p.considerSame = toBool(val);
-                }
-                else if (key == "srvf")
-                {
-                    try { p.srvFactor = std::stof(val); } catch (...) {}
-                }
-                else if (key == "tol")
-                {
-                    try { p.relTol = std::stof(val); } catch (...) {}
-                }
-                else if (key == "grid")
-                {
-                    try { p.gridDim = std::stoi(val); } catch (...) {}
-                }
-                else if (key == "threads")
-                {
-                    try { p.numThreads = std::stoi(val); } catch (...) {}
-                }
-                else if (key == "parallel")
-                {
-                    p.parallel = toBool(val);
-                }
-                // ---- CSV export ----
-                else if (key == "csv" || key == "out" || key == "file")
-                {
-                    p.csvPath = val;
-                }
-                else if (key == "names")
-                {
-                    p.csvIncludeCloudNames = toBool(val);
-                }
-                else if (key == "counts")
-                {
-                    p.csvIncludeAtomCounts = toBool(val);
-                }
-                // ---- Stage-2 aligner ----
-                else if (key == "align" || key == "aligner" || key == "stage2")
-                {
-                    p.runAligner = toBool(val);
-                }
-                else if (key == "optimal" || key == "opt" || key == "exact")
-                {
-                    p.optimal = toBool(val);
-                }
-                else if (key == "alignf")
-                {
-                    try { p.alignFactor = std::stof(val); } catch (...) {}
-                }
-                else if (key == "species")
-                {
-                    p.requireSameNeighborSpecies = toBool(val);
-                }
-                else if (key == "refine")
-                {
-                    try { p.refineIterations = std::stoi(val); } catch (...) {}
-                }
-                else if (key == "max")
-                {
-                    try { p.maxMatches = std::stoul(val); } catch (...) {}
-                }
-                else
-                {
-                    std::cout << "[AtomicExpress] Unknown key '" << key << "', ignored.\n";
-                }
-            }
-            else if (token.find(".csv") != std::string::npos)
-            {
-                // bare path ending in .csv -> treat as CSV output
-                p.csvPath = token;
-            }
-            else
-            {
-                // bare number -> epsilon (matches dup_check / atomic_classify convention)
-                try { p.epsilon = std::stof(token); } catch (...) {}
-            }
-        }
-
-        // Guardrails: maxMatches only means something when the aligner runs
-        if (p.maxMatches > 0 && !p.runAligner)
-        {
-            std::cout << "[AtomicExpress] Note: 'max=' requires 'align=1'; ignoring maxMatches.\n";
-            p.maxMatches = 0;
-        }
-
-        atomOps->runAtomicExpressCount(p, verify);
-    },
-    "  Stage-1 (SRV) parameters:\n"
-    "    epsilon        : Max SRV L_inf threshold in Angstroms (default: 0.10)\n"
-    "    N=<int>        : Number of nearest non-center neighbor dims to compare (default: 4)\n"
-    "    same=<0/1>     : 1 = compare all pairs; 0 = only different center types (default: 0)\n"
-    "    srvf=<float>   : Stage-1 SRV radius multiplier factor (default: 1.0)\n"
-    "    tol=<float>    : Floating-point noise slack tolerance (default: 1e-4)\n"
-    "    grid=<int>     : Grid dimensionality cap, 1..4 (default: 4)\n"
-    "    threads=<int>  : OpenMP thread override, 0 = max available (default: 0)\n"
-    "    parallel=<0/1> : Enable/disable multi-threaded execution (default: 1)\n\n"
-    "  CSV export (optional, off unless csv= is given):\n"
-    "    csv=<path>     : Write materialised pair list to this CSV (also accepts a bare '*.csv')\n"
-    "    names=<0/1>    : Include cloud names in CSV (default: 1)\n"
-    "    counts=<0/1>   : Include atom counts in CSV (default: 1)\n\n"
-    "  Stage-2 aligner (optional, off unless align=1):\n"
-    "    align=<0/1>    : Run bidirectional subset aligner on each Stage-1 survivor (default: 0)\n"
-    "    optimal=<0/1>  : 1 = exact minimum bottleneck; 0 = fast early-exit (default: 0)\n"
-    "    alignf=<float> : Aligner bottleneck radius multiplier factor (default: 1.0)\n"
-    "    species=<0/1>  : Require matched neighbor atoms to have identical element symbols (default: 0)\n"
-    "    refine=<int>   : Kabsch refinement rounds (default: 0)\n"
-    "    max=<int>      : Keep only top-K best aligned pairs, 0 = all (default: 0; requires align=1)\n\n"
-    "  Other:\n"
-    "    verify         : Also run O(M^2) brute-force oracle and diff results (default: off)\n\n"
-    "  Examples:\n"
-    "    atomic_express\n"
-    "    atomic_express 0.08 N=6\n"
-    "    atomic_express 0.10 same=1 grid=3 threads=16\n"
-    "    atomic_express 0.05 N=4 verify\n"
-    "    atomic_express csv=pairs.csv\n"
-    "    atomic_express csv=pairs.csv names=0 counts=0\n"
-    "    atomic_express align=1\n"
-    "    atomic_express align=1 csv=verified.csv N=4 optimal=1 species=1 refine=4 max=200\n"
-    "    atomic_express align=1 alignf=2.0 optimal=0 threads=16");
+            "  Stage-1 (SRV) parameters:\n"
+            "    epsilon         : Max SRV L_inf threshold in Angstroms (default: 0.10)\n"
+            "    N=<int>         : Number of nearest non-center neighbor dims to compare (default: 4)\n"
+            "    same=<0/1>      : 1 = compare all pairs; 0 = only different center types (default: 0)\n"
+            "    srvf=<float>    : Stage-1 SRV radius multiplier factor (default: 1.0)\n"
+            "    tol=<float>     : Floating-point noise slack tolerance (default: 1e-4)\n"
+            "    grid=<int>      : Grid dimensionality cap, 1..4 (default: 4)\n"
+            "    threads=<int>   : OpenMP thread override, 0 = max available (default: 0)\n"
+            "    parallel=<0/1>  : Enable/disable multi-threaded execution (default: 1)\n\n"
+            "  CSV export (optional, off unless csv= is given):\n"
+            "    csv=<path>      : Write materialised pair list to this CSV (also accepts bare '*.csv')\n"
+            "    names=<0/1>     : Include cloud names in CSV (default: 1)\n"
+            "    counts=<0/1>    : Include atom counts in CSV (default: 1)\n\n"
+            "  Batching (bounds peak RAM):\n"
+            "    batch=<int>     : Manual pairs-per-batch (0 disables; default: auto)\n"
+            "    batchbytes=<B>  : Manual bytes-per-batch (ignored if batch= is set)\n"
+            "    auto=<0/1>      : Auto-size batches from free RAM (default: 1)\n"
+            "    pipe=<0/1>      : Run Stage-2 aligner per-batch instead of deferring (default: 1)\n"
+            "    topk=<0/1>      : 1 = global top-K at end (deterministic); 0 = per-batch (default: 1)\n\n"
+            "  Progress tracing:\n"
+            "    trace / trace-lite / quiet  : Convenience presets (no value needed)\n"
+            "        trace       = progress + memory + verbose\n"
+            "        trace-lite  = progress only\n"
+            "        quiet       = all off (default)\n"
+            "    trace=<0/1>     : Print phase markers, count/flush start/end (default: 0)\n"
+            "    mem=<0/1>       : Append RSS to every trace line (default: 0)\n"
+            "    verbose=<0/1>   : Per-table detail + every flush START line (default: 0)\n"
+            "    interval=<s>    : Rate limit for %/ETA lines (default: 0.5 s)\n\n"
+            "  Stage-2 aligner (optional, off unless align=1):\n"
+            "    align=<0/1>     : Run bidirectional subset aligner on each Stage-1 survivor (default: 0)\n"
+            "    optimal=<0/1>   : 1 = exact minimum bottleneck; 0 = fast early-exit (default: 0)\n"
+            "    alignf=<float>  : Aligner bottleneck radius multiplier factor (default: 1.0)\n"
+            "    species=<0/1>   : Require matched neighbor atoms to have identical element symbols (default: 0)\n"
+            "    refine=<int>    : Kabsch refinement rounds (default: 0)\n"
+            "    max=<int>       : Keep only top-K best aligned pairs, 0 = all (default: 0; requires align=1)\n\n"
+            "  Viz store (default: on; only matters when align=1):\n"
+            "    store=<0/1>     : 1 = push aligned pairs into AtomicMatchingViz (default: 1)\n"
+            "                      0 = skip viz store (R.pairs still fully populated for CSV/report)\n"
+            "    noviz           : Shorthand for store=0\n\n"
+            "  Other:\n"
+            "    verify          : Also run O(M^2) brute-force oracle and diff results (default: off)\n\n"
+            "  Examples:\n"
+            "    atomic_express\n"
+            "    atomic_express 0.08 N=6 trace\n"
+            "    atomic_express 0.10 same=1 grid=3 threads=16 trace mem\n"
+            "    atomic_express 0.05 N=4 verify trace\n"
+            "    atomic_express csv=pairs.csv trace mem\n"
+            "    atomic_express csv=pairs.csv names=0 counts=0\n"
+            "    atomic_express align=1 trace\n"
+            "    atomic_express align=1 csv=verified.csv N=4 optimal=1 species=1 refine=4 max=200 trace\n"
+            "    atomic_express align=1 alignf=2.0 optimal=0 threads=16 batch=1000000\n"
+            "    atomic_express align=1 noviz csv=pairs.csv trace\n"
+            "    atomic_express align=1 store=0 optimal=0 csv=pairs.csv\n"
+            "    atomic_express auto=0 quiet   (legacy: materialise all, no progress)");
         ui.registerAlias("express", "atomic_express");
         ui.registerAlias("countPairs", "atomic_express");
         ui.registerAlias("atomicExpress", "atomic_express");
