@@ -219,14 +219,18 @@ public:
     }
 
     void clearAll()
-    {
-        clearAtomicCloudsStorage();
-        MatchingViz::clearAll();
-        m_entries.clear();
-        m_faissManager.clear();
-        m_lastBatchMatches.clear();
-        m_descriptorsDirty = false;
-    }
+{
+    PolyscopeBridge::clearAll();
+    clearAtomicCloudsStorage();
+    MatchingViz::clearAll();
+    m_entries.clear();
+    m_faissManager.clear();
+    m_lastBatchMatches.clear();
+    m_descriptorsDirty = false;
+
+    // RESET THE MOLECULE ID COUNTER BACK TO 0!
+    m_nextId = 0;
+}
 
     void clearAtomicCloudsStorage()
     {

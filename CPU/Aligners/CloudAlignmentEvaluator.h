@@ -87,6 +87,8 @@ public:
     }
 
     /// Picks the pair (a1, a2) maximizing the area of triangle (origin, a1, a2).
+    /// Picks the pair (a1, a2) maximizing the area of triangle (origin, a1, a2),
+    /// ordering them so that ||a1|| >= ||a2||.
     static bool findBestTriangleA(const std::vector<Point3F> &pointsA, size_t &outA1, size_t &outA2)
     {
         size_t n = pointsA.size();
@@ -118,9 +120,19 @@ public:
                 }
             }
         }
-        return maxAreaSq > 1e-10f * maxNormSq * maxNormSq && maxAreaSq > 0.0f;
-    }
 
+        if (!(maxAreaSq > 1e-10f * maxNormSq * maxNormSq && maxAreaSq > 0.0f))
+            return false;
+
+        const auto &p1 = pointsA[outA1];
+        const auto &p2 = pointsA[outA2];
+        const float n1Sq = p1.x * p1.x + p1.y * p1.y + p1.z * p1.z;
+        const float n2Sq = p2.x * p2.x + p2.y * p2.y + p2.z * p2.z;
+        if (n2Sq > n1Sq)
+            std::swap(outA1, outA2);
+
+        return true;
+    }
     /// Orthonormal right-handed frame (columns e1,e2,e3; row-major storage) from (p1, p2).
     static bool makeFrame(const Point3F &p1, const Point3F &p2, float F[9])
     {
@@ -161,6 +173,55 @@ public:
                 R[r * 3 + c] = Fb[r * 3 + 0] * Fa[c * 3 + 0] + Fb[r * 3 + 1] * Fa[c * 3 + 1] + Fb[r * 3 + 2] * Fa[c * 3 + 2];
     }
 
+    /// 1D fallback (A is collinear through its centroid): index of the point farthest from the origin.
+    static bool findAxisA(const std::vector<Point3F> &pointsA, size_t &outA1)
+    {
+        float maxNormSq = 0.0f;
+        outA1 = 0;
+        for (size_t i = 0; i < pointsA.size(); ++i)
+        {
+            const auto &p = pointsA[i];
+            const float nsq = p.x * p.x + p.y * p.y + p.z * p.z;
+            if (nsq > maxNormSq)
+            {
+                maxNormSq = nsq;
+                outA1 = i;
+            }
+        }
+        return maxNormSq > 1e-24f;
+    }
+
+    /// Right-handed orthonormal frame whose first column is p/|p|; e2,e3 are arbitrary
+    /// (the twist about the axis is irrelevant for collinear data).
+    static bool makeAxisFrame(const Point3F &p, float F[9])
+    {
+        const float l = pointNorm(p);
+        if (l < 1e-12f)
+            return false;
+        const float e1x = p.x / l, e1y = p.y / l, e1z = p.z / l;
+        // helper axis = coordinate axis least aligned with e1
+        float hx = 0, hy = 0, hz = 0;
+        const float ax = std::abs(e1x), ay = std::abs(e1y), az = std::abs(e1z);
+        if (ax <= ay && ax <= az)
+            hx = 1;
+        else if (ay <= az)
+            hy = 1;
+        else
+            hz = 1;
+        float e2x = e1y * hz - e1z * hy, e2y = e1z * hx - e1x * hz, e2z = e1x * hy - e1y * hx;
+        const float l2 = std::sqrt(e2x * e2x + e2y * e2y + e2z * e2z);
+        e2x /= l2;
+        e2y /= l2;
+        e2z /= l2;
+        const float e3x = e1y * e2z - e1z * e2y;
+        const float e3y = e1z * e2x - e1x * e2z;
+        const float e3z = e1x * e2y - e1y * e2x;
+        F[0] = e1x; F[1] = e2x; F[2] = e3x;
+        F[3] = e1y; F[4] = e2y; F[5] = e3y;
+        F[6] = e1z; F[7] = e2z; F[8] = e3z;
+        return true;
+    }
+
     static AlignmentResult alignAndEvaluate(
         const std::vector<Point3F> &rawCloudA,
         const std::vector<Point3F> &rawCloudB,
@@ -197,12 +258,21 @@ public:
         }
 
         // ---------- 2. Reference triangle in A, frame Fa ----------
-        size_t a1, a2;
-        if (!findBestTriangleA(A, a1, a2))
-            return result;
+        size_t a1 = 0, a2 = 0;
         float Fa[9];
-        if (!makeFrame(A[a1], A[a2], Fa))
-            return result;
+        bool axisMode = false; // true: A is collinear -> match via 1D projections
+        if (findBestTriangleA(A, a1, a2))
+        {
+            if (!makeFrame(A[a1], A[a2], Fa))
+                return result;
+        }
+        else
+        {
+            if (!findAxisA(A, a1) || !makeAxisFrame(A[a1], Fa))
+                return result;
+            axisMode = true;
+            a2 = a1;
+        }
 
         // ---------- 3. Precomputation ----------
         std::array<float, MAXV> qx, qy, qz, bx, by, bz, na2, nb2;
@@ -274,6 +344,32 @@ public:
         std::string symA1 = checkSymbols ? (*opt.symbolsA)[a1] : "";
         std::string symA2 = checkSymbols ? (*opt.symbolsA)[a2] : "";
 
+        if (axisMode)
+        {
+            // 1D candidates: image axis u = B_j/|B_j| for a1 (the farthest A point).
+            // Rank by max difference of sorted 1D projections of A and B onto u.
+            std::vector<float> tA(n), tB(n);
+            for (size_t i = 0; i < n; ++i)
+                tA[i] = qx[i];
+            std::sort(tA.begin(), tA.end());
+            const float minNb2 = 1e-12f * scale * scale;
+            for (size_t j = 0; j < n; ++j)
+            {
+                if (nb2[j] <= minNb2)
+                    continue;
+                if (checkSymbols && (*opt.symbolsB)[j] != symA1)
+                    continue;
+                const float inv = 1.0f / std::sqrt(nb2[j]);
+                for (size_t k = 0; k < n; ++k)
+                    tB[k] = (bx[k] * bx[j] + by[k] * by[j] + bz[k] * bz[j]) * inv;
+                std::sort(tB.begin(), tB.end());
+                float c = 0.0f;
+                for (size_t k = 0; k < n; ++k)
+                    c = std::max(c, std::abs(tA[k] - tB[k]));
+                cands.push_back({c, static_cast<uint16_t>(j), static_cast<uint16_t>(j)});
+            }
+        }
+        else
         for (size_t i = 0; i < n; ++i)
         {
             for (size_t j = i + 1; j < n; ++j)
@@ -359,6 +455,11 @@ public:
             return cover == fullMask;
         };
 
+        auto frameFor = [&](size_t b1, size_t b2, float Fb[9]) -> bool
+        {
+            return axisMode ? makeAxisFrame(B[b1], Fb) : makeFrame(B[b1], B[b2], Fb);
+        };
+
         float bestSq = std::numeric_limits<float>::max();
         size_t bestC = 0;
         bool found = false;
@@ -366,7 +467,7 @@ public:
         for (size_t c = 0; c < cands.size(); ++c)
         {
             float Fb[9];
-            if (!makeFrame(B[cands[c].b1], B[cands[c].b2], Fb))
+            if (!frameFor(cands[c].b1, cands[c].b2, Fb))
                 continue;
 
             const float t = found ? std::nextafter(bestSq, 0.0f) : std::numeric_limits<float>::max();
@@ -398,7 +499,7 @@ public:
         // ---------- 6. Materialize the winner (and optionally refine) ----------
         const size_t b1 = cands[bestC].b1, b2 = cands[bestC].b2;
         float M[9];
-        if (!makeFrame(B[b1], B[b2], M))
+        if (!frameFor(b1, b2, M))
             return result;
 
         auto extractMatching = [&](const float Mx[9], float v, std::vector<size_t> &out) -> bool

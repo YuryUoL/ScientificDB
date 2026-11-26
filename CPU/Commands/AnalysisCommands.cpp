@@ -343,6 +343,9 @@ namespace Commands
         pairCmd("apply_align", "Snaps cloud A onto cloud B using the stored rotation.",
                 [molOps](size_t a, size_t b)
                 { molOps->applyAlignment(a, b); });
+        pairCmd("match_info", "Prints the bijection mapping (e.g. 0:1 1:3) and R/T matrices for a pair.",
+                [molOps](size_t a, size_t b)
+                { molOps->printMatchInfo(a, b); });
 
         ui.registerCommand("list_matches", "", "Lists all stored matchings.",
                            [](std::istringstream &)

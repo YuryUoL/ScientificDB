@@ -115,6 +115,7 @@ void MolecularOperations::writeMatchesCsv(const std::string &csvPath, const std:
     }
 }
 
+
 std::vector<DupMatch> MolecularOperations::runDuplicateCheck(size_t queryIdx, const std::string &csvPath, const DupCheckParams &p, DupRunStats &st)
 {
     const auto &entries = m_store.molecules();
@@ -289,7 +290,67 @@ bool MolecularOperations::printPairAlignmentWithStats(size_t idxA, size_t idxB, 
     std::cout << "  [Matching] Stored. Use 'show_match " << idxA << " " << idxB << "' to display it.\n\n";
     return true;
 }
+bool MolecularOperations::printMatchInfo(size_t a, size_t b) const
+{
+    const auto &entries = m_store.molecules();
+    if (a >= entries.size() || b >= entries.size())
+    {
+        std::cout << "[Matching] Error: Index out of range.\n";
+        return false;
+    }
 
+    const auto *m = MatchingViz::find(entries[a].id, entries[b].id);
+    if (!m)
+    {
+        std::cout << "[Matching] No stored matching for pair (" 
+                  << a << ", " << b << "). Run 'aligner " 
+                  << a << " " << b << "' or 'dup_check' first.\n";
+        return false;
+    }
+
+    std::cout << "\n=======================================================\n";
+    std::cout << " MATCH INFO: " << a << " (" << entries[a].filename << ") -> "
+              << b << " (" << entries[b].filename << ")\n";
+    std::cout << "=======================================================\n";
+    std::cout << "Bottleneck Dist : " << std::fixed << std::setprecision(6) << m->bottleneck << "\n";
+
+    // 1. Bijection Matching in simplified format: 0:1 1:3 2:4 ...
+    std::cout << "Matching Map    : ";
+    if (m->matching.empty())
+    {
+        std::cout << "(none)\n";
+    }
+    else
+    {
+        for (size_t i = 0; i < m->matching.size(); ++i)
+        {
+            std::cout << i << ":" << m->matching[i] << (i + 1 < m->matching.size() ? " " : "");
+        }
+        std::cout << "\n";
+    }
+
+    // 2. Rotation Matrix R (3x3, row-major from m->R[9])
+    std::cout << "Rotation (R)    :\n";
+    for (int r = 0; r < 3; ++r)
+    {
+        std::cout << "  [ ";
+        for (int c = 0; c < 3; ++c)
+        {
+            std::cout << std::setw(10) << std::fixed << std::setprecision(5) << m->R[r * 3 + c] << " ";
+        }
+        std::cout << "]\n";
+    }
+
+    // 3. Translation Vector T (3x1 from m->t[3])
+    std::cout << "Translation (T) :\n";
+    std::cout << "  [ " 
+              << std::setw(10) << std::fixed << std::setprecision(5) << m->t[0] << " "
+              << std::setw(10) << std::fixed << std::setprecision(5) << m->t[1] << " "
+              << std::setw(10) << std::fixed << std::setprecision(5) << m->t[2] << " ]\n";
+
+    std::cout << "=======================================================\n\n";
+    return true;
+}
 AlignmentResult MolecularOperations::computePairAlignmentWithStats(size_t idxA, size_t idxB, AlignmentOptions opt)
 {
     const auto &entries = m_store.molecules();

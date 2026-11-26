@@ -29,9 +29,12 @@ public:
     std::vector<DupMatch> runDuplicateCheck(size_t queryIdx, const std::string &csvPath, const DupCheckParams &p, DupRunStats &st);
     std::vector<DupMatch> runBatchDuplicateCheck(const std::string &csvPath, const DupCheckParams &p, DupRunStats &st);
 
+    
+
     // Alignment & Match Management
     bool printPairAlignmentWithStats(size_t idxA, size_t idxB, AlignmentOptions opt = AlignmentOptions());
     AlignmentResult computePairAlignmentWithStats(size_t idxA, size_t idxB, AlignmentOptions opt = AlignmentOptions());
+    bool printMatchInfo(size_t a, size_t b) const;
     bool setMatchVisible(size_t a, size_t b, bool v);
     void setAllMatchesVisible(bool v);
     bool removeMatch(size_t a, size_t b);

@@ -202,16 +202,178 @@ namespace Commands
 
         // Generate synthetic
         ui.registerCommand(
-            "generate", "[base_count] [copies_per_base] [min_atoms] [max_atoms] [noise_sigma]",
-            "Generates synthetic QM9-like molecules.",
+            "generate", "[base_count] [copies_per_base] [min_atoms] [max_atoms] [noise_sigma] [key=val ...]",
+            "Generates synthetic molecules: random QM9-like clouds, or degenerate / symmetric stress-test clouds.",
             [&xyzStore](std::istringstream &iss)
             {
-                size_t baseMols = 50, copies = 3, minAtoms = 5, maxAtoms = 25;
-                float noise = 0.01f;
-                iss >> baseMols >> copies >> minAtoms >> maxAtoms >> noise;
-                SyntheticMoleculeGenerator::generate(xyzStore, baseMols, copies, minAtoms, maxAtoms, noise);
-            });
+                std::vector<std::string> pos;
+                std::map<std::string, std::string> kv;
+                std::string token;
+                std::string lastKey = "";
 
+                // Robust tokenizer: supports standard key=val, pos args,
+                // and handles accidental spaces in lists (e.g., kinds=collinear, nearcollinear)
+                while (iss >> token)
+                {
+                    size_t eq = token.find('=');
+                    if (eq != std::string::npos)
+                    {
+                        lastKey = token.substr(0, eq);
+                        kv[lastKey] = token.substr(eq + 1);
+                    }
+                    else
+                    {
+                        if (!lastKey.empty() && !kv[lastKey].empty() && kv[lastKey].back() == ',')
+                        {
+                            kv[lastKey] += token;
+                        }
+                        else
+                        {
+                            lastKey.clear();
+                            pos.push_back(token);
+                        }
+                    }
+                }
+
+                auto asBool = [](const std::string &v)
+                { return v == "1" || v == "on" || v == "true" || v == "yes"; };
+
+                std::string mode = kv.count("mode") ? kv["mode"] : (kv.count("kinds") ? "degenerate" : "standard");
+                std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) { return std::tolower(c); });
+
+                const bool degenerate = (mode == "degenerate" || mode == "deg");
+                if (!degenerate && mode != "standard")
+                {
+                    std::cout << "[Error] Unknown mode '" << mode << "' (use 'standard' or 'degenerate').\n";
+                    return;
+                }
+
+                // Default parameters
+                size_t baseMols = degenerate ? 10 : 50;
+                size_t copies   = 3;
+                size_t minAtoms = degenerate ? 4 : 5;
+                size_t maxAtoms = 25;
+                float noise     = degenerate ? 0.0f : 0.01f;
+
+                try
+                {
+                    // 1. Positional arguments
+                    if (pos.size() > 0) baseMols = std::stoul(pos[0]);
+                    if (pos.size() > 1) copies   = std::stoul(pos[1]);
+                    if (pos.size() > 2) minAtoms = std::stoul(pos[2]);
+                    if (pos.size() > 3) maxAtoms = std::stoul(pos[3]);
+                    if (pos.size() > 4) noise    = std::stof(pos[4]);
+
+                    // 2. Keyword overrides (convenient if caller uses named keys)
+                    if (kv.count("bases"))  baseMols = std::stoul(kv["bases"]);
+                    if (kv.count("copies")) copies   = std::stoul(kv["copies"]);
+                    if (kv.count("min"))    minAtoms = std::stoul(kv["min"]);
+                    if (kv.count("max"))    maxAtoms = std::stoul(kv["max"]);
+                    if (kv.count("noise"))  noise    = std::stof(kv["noise"]);
+                }
+                catch (...)
+                {
+                    std::cout << "[Error] Invalid numeric arguments.\n"
+                              << "Usage: generate [base_count] [copies_per_base] [min_atoms] [max_atoms] [noise_sigma] [key=val ...]\n";
+                    return;
+                }
+
+                if (minAtoms > maxAtoms)
+                {
+                    std::cout << "[Warning] min_atoms (" << minAtoms << ") > max_atoms (" << maxAtoms << "). Swapping.\n";
+                    std::swap(minAtoms, maxAtoms);
+                }
+
+                // --- Standard QM9-like Generation ---
+                if (!degenerate)
+                {
+                    for (const char *k : {"kinds", "eps", "shuffle", "seed", "single"})
+                    {
+                        if (kv.count(k))
+                            std::cout << "Note: '" << k << "' only applies to mode=degenerate (ignored).\n";
+                    }
+
+                    std::cout << "[Command] Generating " << baseMols << " base standard molecule(s) with "
+                              << copies << " copies each (Total: " << baseMols * (1 + copies) << ")...\n";
+                    SyntheticMoleculeGenerator::generate(xyzStore, baseMols, copies, minAtoms, maxAtoms, noise);
+                    return;
+                }
+
+                // --- Degenerate / Symmetry Stress Generation ---
+                std::string unknown;
+                std::string kindsArg = kv.count("kinds") ? kv["kinds"] : "all";
+                unsigned mask = SyntheticMoleculeGenerator::parseDegenerateKinds(kindsArg, &unknown);
+
+                if (!unknown.empty())
+                    std::cout << "Warning: unknown kind(s) ignored: " << unknown << "\n";
+
+                if (mask == 0)
+                {
+                    std::cout << "[Error] No valid degenerate kinds selected. Try kinds=all or kinds=collinear,symmetric\n";
+                    return;
+                }
+
+                std::vector<std::string> activeKindNames;
+                for (unsigned b = 0; b < SyntheticMoleculeGenerator::NUM_DEG_KINDS; ++b)
+                {
+                    if (mask & (1u << b))
+                        activeKindNames.push_back(SyntheticMoleculeGenerator::degenerateKindName(1u << b));
+                }
+
+                size_t activeKinds = activeKindNames.size();
+                size_t totalExpected = activeKinds * baseMols * (1 + copies);
+
+                std::cout << "[Command] Degenerate mode active:\n"
+                          << "  - Active kinds (" << activeKinds << "): ";
+                for (size_t i = 0; i < activeKindNames.size(); ++i)
+                    std::cout << activeKindNames[i] << (i + 1 < activeKindNames.size() ? ", " : "\n");
+                std::cout << "  - Bases per kind : " << baseMols << "\n"
+                          << "  - Copies per base: " << copies << "\n"
+                          << "  - Total expected : " << totalExpected << " molecules\n";
+
+                float eps = 0.0f;
+                unsigned seed = 1234;
+                try
+                {
+                    if (kv.count("eps"))  eps  = std::stof(kv["eps"]);
+                    if (kv.count("seed")) seed = static_cast<unsigned>(std::stoul(kv["seed"]));
+                }
+                catch (...)
+                {
+                    std::cout << "[Error] Invalid eps or seed value.\n";
+                    return;
+                }
+
+                const bool shuffle = kv.count("shuffle") ? asBool(kv["shuffle"]) : true;
+                const bool single  = kv.count("single")  ? asBool(kv["single"])  : false;
+
+                SyntheticMoleculeGenerator::generateDegenerate(xyzStore, mask, baseMols, copies, minAtoms, maxAtoms,
+                                                               noise, eps, shuffle, seed, single);
+            },
+            "  Modes:\n"
+            "    standard (default): random QM9-like molecules; positional args are\n"
+            "      base_count (50), copies_per_base (3), min_atoms (5), max_atoms (25), noise_sigma (0.01)\n"
+            "    degenerate: stress-test clouds for the aligner; base_count means bases PER KIND\n"
+            "      (defaults: 10, 3, 4, 25, noise 0.0). Atom count is clamped to 2..64.\n\n"
+            "  Parameters for mode=degenerate (mode=degenerate is implied by kinds=):\n"
+            "    kinds=<list>   : comma-separated kinds or groups (default: all)\n"
+            "    eps=<float>    : jitter for near-* kinds; <=0 sweeps 1e-7..1e-2 across bases (default: 0)\n"
+            "    shuffle=<0/1>  : randomly permute atom order in copies (default: 1)\n"
+            "    single=<0/1>   : give every atom symbol C; use with symbol=1 on symmetric kinds (default: 0)\n"
+            "    seed=<int>     : RNG seed (default: 1234)\n\n"
+            "  Kinds:\n"
+            "    Degenerate : collinear nearcollinear planar nearplanar coincident nearcoincident\n"
+            "                 duplicates lineoutlier tinyscale farcollinear twoatoms\n"
+            "    Symmetric  : equalline centrosym polygon cubeshells mirror prism\n"
+            "    Near-sym   : nearcentrosym nearmirror nearprism nearpolygon nearcubeshells\n"
+            "    Groups     : all | degenerate | symmetric | nearsymmetric\n\n"
+            "  Output names: synth_deg_<kind>_<b>_base.xyz and synth_deg_<kind>_<b>_copy_<c>.xyz\n"
+            "  Note: noise_sigma > 0 makes copies 3D-noisy while the base stays degenerate, so exact\n"
+            "        optimality is not guaranteed for 1D/2D bases (see aligner refine=).\n\n"
+            "  Examples:\n"
+            "    generate 100 3 5 25 0.01\n"
+            "    generate 10 3 4 25 0 mode=degenerate kinds=collinear,nearcollinear eps=0\n"
+            "    generate 20 2 6 30 0 kinds=symmetric,nearsymmetric single=1 seed=7");
         // Expand all molecules into atomic neighborhood clouds
         ui.registerCommand(
             "expand_atoms", "",

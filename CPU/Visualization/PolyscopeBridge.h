@@ -318,4 +318,22 @@ namespace PolyscopeBridge {
             std::cout << "[Polyscope] Warning: Structure '" << cloudName << "' is not currently rendered.\n";
         }
     }
+
+      inline void clearAll() {
+        // 1. Remove all tracked molecule point clouds from Polyscope
+        // for (const auto& [cloudName, _] : s_labelData) {
+        //     if (polyscope::hasPointCloud(cloudName)) {
+        //         polyscope::removePointCloud(cloudName, /* errorIfAbsent = */ false);
+        //     }
+        // }
+
+        // Alternatively, if you want Polyscope completely purged of ALL registered structures:
+        polyscope::removeAllStructures();
+
+        // 2. Clear label tracking data
+        s_labelData.clear();
+
+        // 3. Reset active cloud pointer/name
+        s_activeCloudName.clear();
+    }
 }
