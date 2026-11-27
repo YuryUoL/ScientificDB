@@ -8,6 +8,7 @@
 #include <iostream>
 #include <chrono>
 #include <iomanip>
+#include "CPU/Aligners/ProjectionBasedInvariantDistance.h"
 #include <omp.h>
 
 namespace Commands
@@ -82,59 +83,129 @@ namespace Commands
         ui.registerAlias("knn_chain", "chain");
 
         // pair_dist
-        ui.registerCommand(
-            "pair_dist", "<index1> <index2> [metric: srv/sdv/pdd/aligner] [key=val ...]",
-            "Computes exact distance metric or full rigid alignment.",
-            [molOps](std::istringstream &iss)
+           // pair_dist
+    ui.registerCommand(
+        "pair_dist", "<index1> <index2> [metric: srv/sdv/pdd/aligner/FullProjectionDistance] [key=val ...]",
+        "Computes exact distance metric or full rigid alignment.",
+        [molOps](std::istringstream &iss)
+        {
+            size_t idx1, idx2;
+            std::string metric = "pdd";
+            if (iss >> idx1 >> idx2)
             {
-                size_t idx1, idx2;
-                std::string metric = "pdd";
-                if (iss >> idx1 >> idx2)
+                if (!(iss >> metric))
+                    metric = "pdd";
+                if (metric == "aligner")
                 {
-                    if (!(iss >> metric))
-                        metric = "pdd";
-                    if (metric == "aligner")
+                    AlignmentOptions opt;
+                    std::string token;
+                    while (iss >> token)
                     {
-                        AlignmentOptions opt;
-                        std::string token;
-                        while (iss >> token)
-                        {
-                            size_t eq = token.find('=');
-                            if (eq != std::string::npos)
-                                opt.set(token.substr(0, eq), token.substr(eq + 1));
-                        }
-                        molOps->printPairAlignmentWithStats(idx1, idx2, opt);
+                        size_t eq = token.find('=');
+                        if (eq != std::string::npos)
+                            opt.set(token.substr(0, eq), token.substr(eq + 1));
                     }
-                    else
+                    molOps->printPairAlignmentWithStats(idx1, idx2, opt);
+                }
+                else if (metric == "FullProjectionDistance")
+                {
+                    PbiOptions opt; // defaults: eps=0.01 (relative), normalize=1, reflect=0, same=0
+                    auto toBool = [](const std::string &v)
                     {
-                        auto tStart = std::chrono::high_resolution_clock::now();
-                        float dist = molOps->computePairMetric(idx1, idx2, metric);
-                        auto tEnd = std::chrono::high_resolution_clock::now();
-                        double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
-                        if (dist >= 0.0f)
+                        return v == "1" || v == "true" || v == "on" || v == "yes";
+                    };
+                    auto parseEps = [&opt](const std::string &s)
+                    {
+                        try
                         {
-                            std::cout << "\n=======================================================\n"
-                                      << "  PAIRWISE METRIC COMPUTATION (" << metric << ")\n"
-                                      << "=======================================================\n"
-                                      << "  Computed Distance: " << std::fixed << std::setprecision(6) << dist << "\n"
-                                      << "  Time Elapsed     : " << std::fixed << std::setprecision(3) << elapsedMs << " ms\n"
-                                      << "=======================================================\n\n";
+                            opt.epsilon = std::stof(s);
+                        }
+                        catch (...)
+                        {
+                            std::cout << "[FullProjectionDistance] Invalid epsilon '" << s << "', keeping "
+                                      << opt.epsilon << ".\n";
+                        }
+                    };
+
+                    std::string token;
+                    while (iss >> token)
+                    {
+                        size_t eq = token.find('=');
+                        if (eq != std::string::npos)
+                        {
+                            std::string key = token.substr(0, eq);
+                            std::string val = token.substr(eq + 1);
+                            if (key == "eps" || key == "epsilon" || key == "threshold")
+                            {
+                                parseEps(val);
+                            }
+                            else if (key == "same" || key == "same_anchor2")
+                            {
+                                opt.allowSameAnchorSecond = toBool(val);
+                            }
+                            else if (key == "norm" || key == "normalize")
+                            {
+                                opt.normalize = toBool(val);
+                            }
+                            else if (key == "reflect" || key == "reflection" || key == "mirror")
+                            {
+                                opt.allowReflection = toBool(val);
+                            }
+                            else if (key == "early" || key == "early_exit")
+                            {
+                                std::cout << "[FullProjectionDistance] '" << key
+                                          << "' was removed: the outer matching is always computed.\n";
+                            }
+                            else
+                            {
+                                std::cout << "[FullProjectionDistance] Unknown key '" << key << "', ignored.\n";
+                            }
+                        }
+                        else
+                        {
+                            parseEps(token);
                         }
                     }
+
+                    molOps->printFullProjectionDistance(idx1, idx2, opt);
                 }
                 else
                 {
-                    std::cout << "Usage: pair_dist <index1> <index2> [metric] [key=val ...]\n";
+                    auto tStart = std::chrono::high_resolution_clock::now();
+                    float dist = molOps->computePairMetric(idx1, idx2, metric);
+                    auto tEnd = std::chrono::high_resolution_clock::now();
+                    double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+                    if (dist >= 0.0f)
+                    {
+                        std::cout << "\n=======================================================\n"
+                                  << "  PAIRWISE METRIC COMPUTATION (" << metric << ")\n"
+                                  << "=======================================================\n"
+                                  << "  Computed Distance: " << std::fixed << std::setprecision(6) << dist << "\n"
+                                  << "  Time Elapsed     : " << std::fixed << std::setprecision(3) << elapsedMs << " ms\n"
+                                  << "=======================================================\n\n";
+                    }
                 }
-            },
-            "  Parameters for aligner:\n"
-            "    refine=<int>   : Kabsch refinement rounds (default: 0)\n"
-            "    symbol=<0/1>   : Restrict alignment and matching to same-symbol atoms (default: 0)\n"
-            "    accept=<float> : Accept/stop threshold distance (default: 0.0)\n"
-            "    max=<int>      : Max candidate pairs to evaluate, 0 = all (default: 0)\n"
-            "    exact=<0/1>    : 1 = find optimal minimum; 0 = return any / early-exit (default: 1)\n\n"
-            "  Example:\n"
-            "    pair_dist 4210 4214 aligner refine=4 symbol=1 exact=1");
+            }
+            else
+            {
+                std::cout << "Usage: pair_dist <index1> <index2> [metric] [key=val ...]\n";
+            }
+        },
+        "  Parameters for aligner:\n"
+        "    refine=<int>   : Kabsch refinement rounds (default: 0)\n"
+        "    symbol=<0/1>   : Restrict alignment and matching to same-symbol atoms (default: 0)\n"
+        "    accept=<float> : Accept/stop threshold distance (default: 0.0)\n"
+        "    max=<int>      : Max candidate pairs to evaluate, 0 = all (default: 0)\n"
+        "    exact=<0/1>    : 1 = find optimal minimum; 0 = return any / early-exit (default: 1)\n\n"
+        "  Parameters for FullProjectionDistance (outer matching is always computed):\n"
+        "    eps=<float>    : Strict < epsilon threshold (default: 0.01; also accepts bare float or epsilon=)\n"
+        "                     Relative (dimensionless) when norm=1, absolute units when norm=0\n"
+        "    norm=<0/1>     : 1 = normalized point-based representation NPR, divide by R^2 / R^3 (default: 1)\n"
+        "    reflect=<0/1>  : 0 = chirality-sensitive, proper rotations only; 1 = also accept mirrored B (default: 0)\n"
+        "    same=<0/1>     : 1 = allow a2==a1 and b2==b1; 0 = require distinct second anchor (default: 0)\n\n"
+        "  Example:\n"
+        "    pair_dist 4210 4214 aligner refine=4 symbol=1 exact=1\n"
+        "    pair_dist 4210 4214 FullProjectionDistance eps=0.01 norm=1 reflect=0 same=0");
         ui.registerAlias("pairDist", "pair_dist");
         ui.registerAlias("dist_pair", "pair_dist");
 

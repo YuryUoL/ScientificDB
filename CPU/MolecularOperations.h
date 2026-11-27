@@ -6,6 +6,7 @@
 #include "Aligners/CloudAlignmentEvaluator.h"
 #include "Visualization/Matchingvisualizer.h"
 #include "Duplicatechecker.h"
+#include "Aligners/ProjectionBasedInvariantDistance.h"
 
 class MolecularOperations
 {
@@ -47,6 +48,7 @@ public:
     void exploreClusters();
     void setGraphVisible(bool visible) const;
     void clearGraph() const;
+    bool printFullProjectionDistance(size_t idxA, size_t idxB, const PbiOptions &opt = PbiOptions());
 
 private:
     MolecularDatasetStore &m_store;

@@ -508,6 +508,77 @@ void MolecularOperations::exploreClusters()
     MolecularGraphViz::buildClusters(batchMatches, atomCounts);
 }
 
+bool MolecularOperations::printFullProjectionDistance(size_t idxA, size_t idxB, const PbiOptions &opt)
+{
+    const auto &entries = m_store.molecules();
+    if (idxA >= entries.size() || idxB >= entries.size())
+    {
+        std::cout << "[FullProjectionDistance] Error: Index out of range.\n";
+        return false;
+    }
+
+    const auto &molA = entries[idxA];
+    const auto &molB = entries[idxB];
+
+    if (molA.numAtoms != molB.numAtoms || molA.numAtoms < 3)
+    {
+        std::cout << "[FullProjectionDistance] Error: Molecules must have equal atom counts (>= 3).\n";
+        return false;
+    }
+
+    std::vector<ProjectionBasedInvariantDistance::Point3F> cloudA(molA.numAtoms);
+    std::vector<ProjectionBasedInvariantDistance::Point3F> cloudB(molB.numAtoms);
+    for (size_t i = 0; i < molA.numAtoms; ++i)
+    {
+        cloudA[i] = {static_cast<float>(molA.atoms[i].x), static_cast<float>(molA.atoms[i].y), static_cast<float>(molA.atoms[i].z)};
+        cloudB[i] = {static_cast<float>(molB.atoms[i].x), static_cast<float>(molB.atoms[i].y), static_cast<float>(molB.atoms[i].z)};
+    }
+
+    auto tStart = std::chrono::high_resolution_clock::now();
+    PbiFeasibilityResult res = ProjectionBasedInvariantDistance::evaluateFeasible(cloudA, cloudB, opt);
+    auto tEnd = std::chrono::high_resolution_clock::now();
+    double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+
+    size_t matchablePairs = 0;
+    for (float v : res.outerCostMatrix)
+    {
+        if (v < opt.epsilon)
+            ++matchablePairs;
+    }
+
+    std::cout << "\n=======================================================\n"
+              << "  FULL PROJECTION DISTANCE (< epsilon)\n"
+              << "=======================================================\n"
+              << "  Molecule A Index : " << idxA << " (" << molA.filename << ")\n"
+              << "  Molecule B Index : " << idxB << " (" << molB.filename << ")\n"
+              << "  Atoms (N)        : " << molA.numAtoms << "\n"
+              << "  Epsilon          : " << std::fixed << std::setprecision(6) << opt.epsilon
+              << (opt.normalize ? " (relative, NPR)" : " (absolute)") << "\n"
+              << "  Normalized (NPR) : " << (opt.normalize ? "1 (yes)" : "0 (no)") << "\n"
+              << "  Allow Reflection : " << (opt.allowReflection ? "1 (yes)" : "0 (no)") << "\n"
+              << "  Same (a2==a1/..) : " << (opt.allowSameAnchorSecond ? "1 (yes)" : "0 (no)") << "\n"
+              << "-------------------------------------------------------\n"
+              << "  Feasible (< eps) : " << (res.feasible ? "YES" : "NO") << "\n";
+
+    if (res.feasible)
+    {
+        std::cout << "  First Valid Pair : (" << res.firstValidA1 << ", " << res.firstValidB1 << ")\n";
+    }
+
+    std::cout << "  Matchable (a1,b1): " << matchablePairs << " / " << (molA.numAtoms * molB.numAtoms) << "\n"
+              << "  Outer Perfect M. : " << (res.outerPerfectMatching ? "YES" : "NO") << "\n";
+
+    if (opt.allowReflection && res.outerPerfectMatching)
+    {
+        std::cout << "  Matched Mirrored : " << (res.mirrored ? "YES (enantiomer)" : "NO (same handedness)") << "\n";
+    }
+
+    std::cout << "  Time Elapsed     : " << std::fixed << std::setprecision(3) << elapsedMs << " ms\n"
+              << "=======================================================\n\n";
+
+    return true;
+}
+
 void MolecularOperations::setGraphVisible(bool visible) const
 {
     MolecularGraphViz::setGraphVisible(visible);

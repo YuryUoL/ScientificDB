@@ -1,0 +1,158 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amsthm,amssymb}
+\usepackage[margin=1in]{geometry}
+
+\newtheorem{thm}{Theorem}
+\newtheorem{lem}{Lemma}
+
+\begin{document}
+
+\begin{lem}[Normalization is Lipschitz]\label{lem:unit}
+Let $x, y \in \mathbb{R}^3$ with $x \neq 0$ and $y \neq 0$. Then
+\[
+\left\|\frac{x}{\|x\|} - \frac{y}{\|y\|}\right\| \le \frac{2\|x - y\|}{\|x\|}.
+\]
+\end{lem}
+
+\begin{proof}
+By the triangle inequality,
+\[
+\left\|\frac{x}{\|x\|} - \frac{y}{\|y\|}\right\|
+\le \left\|\frac{x}{\|x\|} - \frac{y}{\|x\|}\right\| + \left\|\frac{y}{\|x\|} - \frac{y}{\|y\|}\right\|
+= \frac{\|x - y\|}{\|x\|} + \frac{\bigl|\,\|y\| - \|x\|\,\bigr|}{\|x\|}
+\le \frac{2\|x - y\|}{\|x\|}. \qedhere
+\]
+\end{proof}
+
+\begin{thm}[Conditional Near-Optimality of Frame-Induced 3D Alignment]
+\label{thm:frame_induced_3d_alignment}
+Let $\tilde{A}, \tilde{B} \subset \mathbb{R}^3$ be two $n$-point clouds with centroids $c_A = \frac{1}{n}\sum_{i=1}^n \tilde{a}_i$ and $c_B = \frac{1}{n}\sum_{j=1}^n \tilde{b}_j$, and let $A = \{a_i = \tilde{a}_i - c_A\}_{i=1}^n$ and $B = \{b_j = \tilde{b}_j - c_B\}_{j=1}^n$ be the corresponding centered clouds ($\sum_{i=1}^n a_i = \sum_{j=1}^n b_j = 0$). Let $\rho = \max_{1 \le i \le n} \|a_i\| > 0$.
+
+Let $i_1 \neq i_2$ be indices, and write $a_1 = a_{i_1}$, $a_2 = a_{i_2}$, with cross-product magnitude
+\[
+\Delta_A = \|a_1 \times a_2\| = 2\,\mathrm{Area}(0, a_1, a_2) > 0,
+\]
+and let $F_a = \begin{bmatrix} e_1 & e_2 & e_3 \end{bmatrix} \in \mathrm{SO}(3)$ be the right-handed orthonormal frame anchored at the origin $0$ with basis vectors
+\begin{align*}
+e_1 &= \frac{a_1}{\|a_1\|}, \\
+e_3 &= \frac{a_1 \times a_2}{\|a_1 \times a_2\|}, \\
+e_2 &= e_3 \times e_1,
+\end{align*}
+so that $e_1, e_2, e_3$ are mutually orthogonal unit vectors satisfying $e_1 \times e_2 = e_3$ and $\det(F_a) = +1$.
+
+Suppose there exist a ground-truth rigid motion (rotation $R^* \in \mathrm{SO}(3)$ and translation $t^* \in \mathbb{R}^3$) and a bijection $\pi : \{1,\dots,n\} \to \{1,\dots,n\}$ matching all points within Euclidean error $\varepsilon \ge 0$:
+\[
+\|R^* a_i + t^* - b_{\pi(i)}\| \le \varepsilon \quad \text{for all } i = 1,\dots,n.
+\]
+Set $b_1 = b_{\pi(i_1)}$ and $b_2 = b_{\pi(i_2)}$ as the perturbed counterparts of $a_1$ and $a_2$, let $F_b \in \mathrm{SO}(3)$ be the right-handed orthonormal frame constructed from $(b_1, b_2)$ relative to $0$ by the same rule, and define the frame-induced rotation and translation
+\[
+R_{\mathrm{cand}} = F_b F_a^\top \in \mathrm{SO}(3), \qquad t_{\mathrm{cand}} = c_B - R_{\mathrm{cand}} c_A \in \mathbb{R}^3.
+\]
+Assume the non-degeneracy condition, with $\eta = 2\varepsilon$,
+\[
+\eta < \frac{\Delta_A}{4\rho}.
+\]
+Then $F_b$ is well defined, and the bottleneck distance $d_{\mathrm{cand}} = \max_{1 \le i \le n} \|(R_{\mathrm{cand}} \tilde{a}_i + t_{\mathrm{cand}}) - \tilde{b}_{\pi(i)}\|$ achieved by this frame-induced transformation satisfies
+\[
+d_{\mathrm{cand}} \le \left(2 + \frac{9\sqrt{2}\,\rho^2}{\Delta_A} + \frac{(4+4\sqrt{2})\,\rho}{\|a_1\|}\right)\varepsilon \le \left(2 + \frac{23\,\rho^2}{\Delta_A}\right)\varepsilon.
+\]
+In particular, the minimum bottleneck distance over all rigid motions and bijections (or over any candidate set containing $(R_{\mathrm{cand}}, t_{\mathrm{cand}})$) is bounded above by the same quantity.
+\end{thm}
+
+\begin{proof}
+\noindent\textbf{Preliminary inequalities.}
+Since $\Delta_A = \|a_1 \times a_2\| \le \|a_1\|\,\|a_2\| \le \rho\,\|a_1\|$ and $\|a_1\| \le \rho$, we have
+\begin{equation}\label{eq:prelim}
+\Delta_A \le \rho^2, \qquad \frac{\rho}{\|a_1\|} \le \frac{\rho^2}{\Delta_A}, \qquad
+\eta < \frac{\Delta_A}{4\rho} \le \frac{\|a_1\|}{4} \le \frac{\rho}{4}.
+\end{equation}
+Note that $\Delta_A > 0$ forces $a_1 \neq 0$ and $a_2 \neq 0$.
+
+\medskip
+\noindent\textbf{Step 1: Centering error.}
+Since $\pi$ is a bijection, $\sum_{i=1}^n b_{\pi(i)} = \sum_{j=1}^n b_j = 0$, and $\sum_{i=1}^n a_i = 0$. Averaging $R^* a_i + t^* - b_{\pi(i)}$ over $i$ gives
+\[
+\|t^*\| = \left\|\frac{1}{n}\sum_{i=1}^n \bigl(R^* a_i + t^* - b_{\pi(i)}\bigr)\right\| \le \frac{1}{n}\sum_{i=1}^n \|R^* a_i + t^* - b_{\pi(i)}\| \le \varepsilon.
+\]
+Hence, for every $i \in \{1,\dots,n\}$,
+\[
+\|R^* a_i - b_{\pi(i)}\| \le \|R^* a_i + t^* - b_{\pi(i)}\| + \|t^*\| \le 2\varepsilon = \eta.
+\]
+
+\medskip
+\noindent\textbf{Step 2: Perturbation of the frame $F_b$ relative to $R^* F_a$.}
+Let $u_1 = R^* a_1$ and $u_2 = R^* a_2$. Since $R^* \in \mathrm{SO}(3)$ preserves norms and cross products ($R^*(x \times y) = R^*x \times R^*y$), the frame constructed from $(u_1, u_2)$ relative to $0$ is $R^* F_a = \begin{bmatrix} R^* e_1 & R^* e_2 & R^* e_3 \end{bmatrix}$ with
+\[
+R^* e_1 = \frac{u_1}{\|u_1\|}, \qquad
+R^* e_3 = \frac{u_1 \times u_2}{\|u_1 \times u_2\|}, \qquad
+R^* e_2 = (R^* e_3) \times (R^* e_1).
+\]
+Likewise $F_b = \begin{bmatrix} \tilde{e}_1 & \tilde{e}_2 & \tilde{e}_3 \end{bmatrix}$ is given by
+\[
+\tilde{e}_1 = \frac{b_1}{\|b_1\|}, \qquad
+\tilde{e}_3 = \frac{b_1 \times b_2}{\|b_1 \times b_2\|}, \qquad
+\tilde{e}_2 = \tilde{e}_3 \times \tilde{e}_1,
+\]
+provided $b_1 \neq 0$ and $b_1 \times b_2 \neq 0$ (verified below). We have $\|u_1\| = \|a_1\| \le \rho$, $\|u_2\| = \|a_2\| \le \rho$, $\|u_1 \times u_2\| = \Delta_A$, and by Step 1, $\|u_1 - b_1\| \le \eta$, $\|u_2 - b_2\| \le \eta$.
+
+\emph{First column.} By \eqref{eq:prelim}, $\|b_1\| \ge \|a_1\| - \eta > 0$, so $\tilde{e}_1$ is defined, and Lemma~\ref{lem:unit} gives
+\[
+\|R^* e_1 - \tilde{e}_1\| = \left\|\frac{u_1}{\|u_1\|} - \frac{b_1}{\|b_1\|}\right\| \le \frac{2\eta}{\|a_1\|}.
+\]
+
+\emph{Third column.} Since $\|b_1\| \le \|u_1\| + \eta \le \rho + \eta$,
+\[
+\|u_1 \times u_2 - b_1 \times b_2\| = \|(u_1 - b_1) \times u_2 + b_1 \times (u_2 - b_2)\| \le \eta\rho + (\rho + \eta)\eta = \eta(2\rho + \eta).
+\]
+By \eqref{eq:prelim}, $\eta < \rho/4$, so $2\rho + \eta < \tfrac{9}{4}\rho$, and $\eta < \Delta_A/(4\rho)$, so
+\[
+\|u_1 \times u_2 - b_1 \times b_2\| < \tfrac{9}{4}\rho\,\eta < \tfrac{9}{16}\Delta_A < \Delta_A.
+\]
+Hence $b_1 \times b_2 \neq 0$, so $\tilde{e}_3$ is defined, and $\tilde{e}_3 \perp \tilde{e}_1$ (as $b_1 \times b_2 \perp b_1$), so $F_b \in \mathrm{SO}(3)$ is a well-defined right-handed frame. Lemma~\ref{lem:unit} gives
+\[
+\|R^* e_3 - \tilde{e}_3\| = \left\|\frac{u_1 \times u_2}{\|u_1 \times u_2\|} - \frac{b_1 \times b_2}{\|b_1 \times b_2\|}\right\| \le \frac{2 \cdot \frac{9}{4}\rho\,\eta}{\Delta_A} = \frac{9\rho\,\eta}{2\Delta_A}.
+\]
+
+\emph{Second column.} Since $\|R^* e_1\| = \|\tilde{e}_3\| = 1$,
+\begin{align*}
+\|R^* e_2 - \tilde{e}_2\|
+&= \|(R^* e_3) \times (R^* e_1) - \tilde{e}_3 \times \tilde{e}_1\| \\
+&= \|(R^* e_3 - \tilde{e}_3) \times (R^* e_1) + \tilde{e}_3 \times (R^* e_1 - \tilde{e}_1)\| \\
+&\le \|R^* e_3 - \tilde{e}_3\| + \|R^* e_1 - \tilde{e}_1\| \\
+&\le \frac{9\rho\,\eta}{2\Delta_A} + \frac{2\eta}{\|a_1\|}.
+\end{align*}
+Write $E_1 = \dfrac{2\eta}{\|a_1\|}$, $E_3 = \dfrac{9\rho\,\eta}{2\Delta_A}$, $E_2 = E_1 + E_3$ for the three column bounds; note $E_1, E_3 \le E_2$.
+
+\medskip
+\noindent\textbf{Step 3: Pointwise rotation residual.}
+Let $q_i = F_a^\top a_i = (q_{ix}, q_{iy}, q_{iz})^\top$. Then $R_{\mathrm{cand}} a_i = F_b q_i$, $R^* a_i = (R^* F_a) q_i$, and $\|q_i\| = \|a_i\| \le \rho$, so $|q_{ix}| \le \rho$ and $|q_{iy}| + |q_{iz}| \le \sqrt{2}\,\|q_i\| \le \sqrt{2}\,\rho$. Expanding in the frame basis,
+\begin{align*}
+\|R_{\mathrm{cand}} a_i - R^* a_i\|
+&= \|(F_b - R^* F_a) q_i\| \\
+&\le |q_{ix}|\,E_1 + |q_{iy}|\,E_2 + |q_{iz}|\,E_3 \\
+&\le \rho\,E_1 + (|q_{iy}| + |q_{iz}|)\,E_2 \\
+&\le \rho\,E_1 + \sqrt{2}\,\rho\,(E_1 + E_3) \\
+&= \rho\left(\frac{2\eta}{\|a_1\|}\right) + \sqrt{2}\,\rho\left(\frac{9\rho\,\eta}{2\Delta_A} + \frac{2\eta}{\|a_1\|}\right) \\
+&= \left(\frac{9\sqrt{2}}{2}\,\frac{\rho^2}{\Delta_A} + (2 + 2\sqrt{2})\,\frac{\rho}{\|a_1\|}\right)\eta.
+\end{align*}
+
+\medskip
+\noindent\textbf{Step 4: Bottleneck bound.}
+Using $\tilde{a}_i = a_i + c_A$, $\tilde{b}_{\pi(i)} = b_{\pi(i)} + c_B$, $t_{\mathrm{cand}} = c_B - R_{\mathrm{cand}} c_A$, and $\eta = 2\varepsilon$, for every $i$,
+\begin{align*}
+\|(R_{\mathrm{cand}} \tilde{a}_i + t_{\mathrm{cand}}) - \tilde{b}_{\pi(i)}\|
+&= \|R_{\mathrm{cand}} a_i - b_{\pi(i)}\| \\
+&\le \|R_{\mathrm{cand}} a_i - R^* a_i\| + \|R^* a_i - b_{\pi(i)}\| \\
+&\le \left(\frac{9\sqrt{2}}{2}\,\frac{\rho^2}{\Delta_A} + (2 + 2\sqrt{2})\,\frac{\rho}{\|a_1\|}\right)2\varepsilon + 2\varepsilon \\
+&= \left(2 + \frac{9\sqrt{2}\,\rho^2}{\Delta_A} + \frac{(4+4\sqrt{2})\,\rho}{\|a_1\|}\right)\varepsilon.
+\end{align*}
+Finally, by \eqref{eq:prelim}, $\rho/\|a_1\| \le \rho^2/\Delta_A$, and $9\sqrt{2} + 4 + 4\sqrt{2} = 13\sqrt{2} + 4 \approx 22.39 < 23$, so
+\[
+d_{\mathrm{cand}} \le \left(2 + \frac{9\sqrt{2}\,\rho^2}{\Delta_A} + \frac{(4+4\sqrt{2})\,\rho}{\|a_1\|}\right)\varepsilon \le \left(2 + \frac{23\,\rho^2}{\Delta_A}\right)\varepsilon. \qedhere
+\]
+\end{proof}
+
+\end{document}
